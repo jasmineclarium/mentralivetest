@@ -27,8 +27,17 @@ type SessionData = {
   userId: string;
   step: ScanStep;
   ext: Extraction;
-  hlsUrl: string | null;
 };
+
+function resetExtraction(): Extraction {
+  return {
+    productName: null,
+    manufacturer: null,
+    barcode: null,
+    expiryDate: null,
+    noExpiryConfirmed: false,
+  };
+}
 
 function parseJSON(text: string) {
   try {
@@ -49,9 +58,9 @@ function calcExpiry(d: string) {
 
 function expiryLine(d: string) {
   const { isExpired, days } = calcExpiry(d);
-  if (isExpired) return `Warning! This product is EXPIRED. It expired ${Math.abs(days)} days ago.`;
+  if (isExpired) return `Warning. This product is expired. It expired ${Math.abs(days)} days ago.`;
   if (days === 0) return `Expiry date ${d}. This expires today.`;
-  if (days <= 7) return `Expiry date ${d}. Caution, only ${days} days left.`;
+  if (days <= 7) return `Expiry date ${d}. Caution. Only ${days} days left.`;
   return `Expiry date ${d}. Good for ${days} more days.`;
 }
 
@@ -101,16 +110,6 @@ function isNoExpiry(text: string) {
   );
 }
 
-function resetExtraction(): Extraction {
-  return {
-    productName: null,
-    manufacturer: null,
-    barcode: null,
-    expiryDate: null,
-    noExpiryConfirmed: false,
-  };
-}
-
 class ProductScannerApp extends AppServer {
   private sessions = new Map<string, SessionData>();
 
@@ -123,17 +122,19 @@ class ProductScannerApp extends AppServer {
       userId,
       step: 'idle',
       ext: resetExtraction(),
-      hlsUrl: null,
     };
 
     this.sessions.set(sessionId, data);
     console.log(`Session started for user ${userId}`);
 
-    await session.audio.speak('Product scanner ready. Say scan or press the button to start.');
+    await session.audio.speak(
+      'Product scanner ready. Say scan or press the button to start.'
+    );
 
     session.events.onTranscription(async (t: any) => {
       if (!t.isFinal) return;
-      const text = t.text.toLowerCase().trim();
+
+      const text = (t.text || '').toLowerCase().trim();
       console.log('Final transcription:', text);
 
       if (text.includes('cancel') || text.includes('stop')) {
@@ -158,10 +159,10 @@ class ProductScannerApp extends AppServer {
           return;
         }
 
-        const d = dateFromSpeech(text);
-        if (d) {
-          data.ext.expiryDate = d;
-          await session.audio.speak(`${expiryLine(d)} Saving now.`);
+        const spokenDate = dateFromSpeech(text);
+        if (spokenDate) {
+          data.ext.expiryDate = spokenDate;
+          await session.audio.speak(`${expiryLine(spokenDate)} Saving now.`);
           await this.saveItem(session, data);
           return;
         }
@@ -173,9 +174,9 @@ class ProductScannerApp extends AppServer {
     });
 
     session.events.onButtonPress(async (btn: any) => {
-      console.log('Button press:', btn.pressType);
+      console.log('Button press:', btn?.pressType);
 
-      if (btn.pressType === 'long') {
+      if (btn?.pressType === 'long') {
         if (data.step === 'idle') {
           await this.readList(session, data);
         } else {
@@ -184,7 +185,7 @@ class ProductScannerApp extends AppServer {
         return;
       }
 
-      if (btn.pressType !== 'short') return;
+      if (btn?.pressType !== 'short') return;
 
       if (data.step === 'idle') {
         await this.beginFlow(session, data);
@@ -208,12 +209,14 @@ class ProductScannerApp extends AppServer {
 
     session.events.onDisconnected(() => {
       this.sessions.delete(sessionId);
+      console.log(`Session disconnected: ${sessionId}`);
     });
   }
 
   private async beginFlow(session: any, data: SessionData) {
     data.ext = resetExtraction();
     data.step = 'front';
+
     await session.audio.speak(
       'Starting scan. Hold the front label still in view, then press the button to capture the product image.'
     );
@@ -227,24 +230,51 @@ class ProductScannerApp extends AppServer {
 
   private async takePhoto(session: any, label: string) {
     console.log(`Capturing photo for step: ${label}`);
-    const photo = await session.camera.requestPhoto({ compress: 'medium', size: 'large' });
+
+    const photo = await session.camera.requestPhoto({
+      compress: 'medium',
+      size: 'large',
+    });
+
+    const bytes =
+      photo?.buffer && typeof photo.buffer.length === 'number'
+        ? photo.buffer.length
+        : 0;
 
     console.log('Photo captured', {
       step: label,
-      bytes: photo?.buffer?.length,
+      bytes,
       hasBuffer: !!photo?.buffer,
+      mimeType: photo?.mimeType || 'image/jpeg',
     });
 
-    const base64 = photo.buffer.toString('base64');
-    return base64;
+    if (!photo?.buffer || bytes === 0) {
+      throw new Error(`No image buffer returned for step: ${label}`);
+    }
+
+    return {
+      base64: photo.buffer.toString('base64'),
+      mimeType: photo?.mimeType || 'image/jpeg',
+      bytes,
+    };
   }
 
-  private async runGemini(prompt: string, base64: string, label: string) {
+  private async runGemini(
+    prompt: string,
+    base64: string,
+    mimeType: string,
+    label: string
+  ) {
     console.log(`Sending image to Gemini for step: ${label}`);
-    console.log('Prompt:', prompt);
+    console.log(`Base64 length for ${label}:`, base64.length);
 
     const resp = await model.generateContent([
-      { inlineData: { mimeType: 'image/jpeg', data: base64 } },
+      {
+        inlineData: {
+          mimeType,
+          data: base64,
+        },
+      },
       prompt,
     ]);
 
@@ -254,14 +284,14 @@ class ProductScannerApp extends AppServer {
     const parsed = parseJSON(text);
     console.log(`Gemini parsed response for ${label}:`, parsed);
 
-    return parsed;
+    return { text, parsed };
   }
 
   private async captureFrontLabel(session: any, data: SessionData) {
-    await session.audio.speak('Photo captured. Checking front label.');
-
     try {
-      const base64 = await this.takePhoto(session, 'front');
+      await session.audio.speak('Capturing product image now.');
+
+      const photo = await this.takePhoto(session, 'front');
 
       const prompt = `Analyze this product package front label.
 Extract ONLY clearly visible info.
@@ -272,33 +302,50 @@ Rules:
 - manufacturer should be the brand or maker
 - use null if unclear`;
 
-      const result = await this.runGemini(prompt, base64, 'front');
+      const { parsed, text } = await this.runGemini(
+        prompt,
+        photo.base64,
+        photo.mimeType,
+        'front'
+      );
 
-      if (!result || !result.product_name) {
+      if (!parsed || !parsed.product_name) {
         await session.audio.speak(
-          'I could not identify the product yet. Please hold the front label steady, closer to the glasses, and press the button again.'
+          'I captured the image, but I could not identify the product yet. Please hold the front label closer and steadier, then press the button again.'
         );
         return;
       }
 
-      data.ext.productName = result.product_name;
-      data.ext.manufacturer = result.manufacturer || null;
+      data.ext.productName = parsed.product_name;
+      data.ext.manufacturer = parsed.manufacturer || null;
       data.step = 'barcode';
 
+      const spokenResult = parsed.manufacturer
+        ? `I found ${parsed.product_name} by ${parsed.manufacturer}.`
+        : `I found ${parsed.product_name}.`;
+
+      console.log('Front capture succeeded:', {
+        productName: data.ext.productName,
+        manufacturer: data.ext.manufacturer,
+        geminiText: text,
+      });
+
       await session.audio.speak(
-        `I found ${result.product_name}${result.manufacturer ? ' by ' + result.manufacturer : ''}. Now show the barcode and press the button.`
+        `${spokenResult} Now show the barcode and press the button.`
       );
     } catch (err) {
       console.error('Front label capture failed:', err);
-      await session.audio.speak('I had trouble reading that image. Please try again.');
+      await session.audio.speak(
+        'I had trouble reading that image. Please try again.'
+      );
     }
   }
 
   private async captureBarcode(session: any, data: SessionData) {
-    await session.audio.speak('Photo captured. Checking barcode.');
-
     try {
-      const base64 = await this.takePhoto(session, 'barcode');
+      await session.audio.speak('Capturing barcode image now.');
+
+      const photo = await this.takePhoto(session, 'barcode');
 
       const prompt = `Analyze this image for a product barcode or QR code.
 Extract ONLY clearly visible info.
@@ -308,32 +355,44 @@ Rules:
 - barcode should be the decoded numeric or alphanumeric value if visible
 - use null if not readable`;
 
-      const result = await this.runGemini(prompt, base64, 'barcode');
+      const { parsed, text } = await this.runGemini(
+        prompt,
+        photo.base64,
+        photo.mimeType,
+        'barcode'
+      );
 
-      if (!result || !result.barcode) {
+      if (!parsed || !parsed.barcode) {
         await session.audio.speak(
-          'I could not read the barcode. Please center the barcode, hold it still, and press the button again.'
+          'I captured the image, but I could not read the barcode. Please center the barcode, hold it still, and press the button again.'
         );
         return;
       }
 
-      data.ext.barcode = result.barcode;
+      data.ext.barcode = parsed.barcode;
       data.step = 'expiry';
 
+      console.log('Barcode capture succeeded:', {
+        barcode: data.ext.barcode,
+        geminiText: text,
+      });
+
       await session.audio.speak(
-        'Barcode captured. Now show the expiration date and press the button. Or say no expiration date.'
+        `I found barcode ${parsed.barcode}. Now show the expiration date and press the button. Or say no expiration date.`
       );
     } catch (err) {
       console.error('Barcode capture failed:', err);
-      await session.audio.speak('I had trouble reading that barcode image. Please try again.');
+      await session.audio.speak(
+        'I had trouble reading that barcode image. Please try again.'
+      );
     }
   }
 
   private async captureExpiry(session: any, data: SessionData) {
-    await session.audio.speak('Photo captured. Checking expiration date.');
-
     try {
-      const base64 = await this.takePhoto(session, 'expiry');
+      await session.audio.speak('Capturing expiration date image now.');
+
+      const photo = await this.takePhoto(session, 'expiry');
 
       const prompt = `Analyze this image for an expiration date, best by date, or use by date.
 Extract ONLY clearly visible info.
@@ -343,27 +402,42 @@ Rules:
 - expiry_date must be YYYY-MM-DD
 - use null if not readable`;
 
-      const result = await this.runGemini(prompt, base64, 'expiry');
+      const { parsed, text } = await this.runGemini(
+        prompt,
+        photo.base64,
+        photo.mimeType,
+        'expiry'
+      );
 
-      if (!result || !result.expiry_date) {
+      if (!parsed || !parsed.expiry_date) {
         await session.audio.speak(
-          'I could not read an expiration date. Please hold the date closer and steadier, press the button again, or say no expiration date.'
+          'I captured the image, but I could not read an expiration date. Please hold the date closer and steadier, press the button again, or say no expiration date.'
         );
         return;
       }
 
-      data.ext.expiryDate = result.expiry_date;
-      await session.audio.speak(`${expiryLine(result.expiry_date)} Saving now.`);
+      data.ext.expiryDate = parsed.expiry_date;
+
+      console.log('Expiry capture succeeded:', {
+        expiryDate: data.ext.expiryDate,
+        geminiText: text,
+      });
+
+      await session.audio.speak(`${expiryLine(parsed.expiry_date)} Saving now.`);
       await this.saveItem(session, data);
     } catch (err) {
       console.error('Expiry capture failed:', err);
-      await session.audio.speak('I had trouble reading that date image. Please try again.');
+      await session.audio.speak(
+        'I had trouble reading that date image. Please try again.'
+      );
     }
   }
 
   private async saveItem(session: any, data: SessionData) {
     if (!data.ext.productName) {
-      await session.audio.speak('I do not have a product name yet, so I cannot save this item.');
+      await session.audio.speak(
+        'I do not have a product name yet, so I cannot save this item.'
+      );
       return;
     }
 
@@ -417,7 +491,7 @@ Rules:
       if (ext.noExpiryConfirmed) {
         tts += '. No expiration date.';
       } else if (expiry?.isExpired) {
-        tts += `. EXPIRED ${Math.abs(expiry.days)} days ago. Please discard.`;
+        tts += `. Expired ${Math.abs(expiry.days)} days ago. Please discard.`;
       } else if (expiry && expiry.days <= 7) {
         tts += `. Caution, expires in ${expiry.days} days.`;
       } else if (ext.expiryDate && expiry) {
@@ -433,7 +507,9 @@ Rules:
     } catch (err) {
       console.error('Database save failed:', err);
       data.step = 'idle';
-      await session.audio.speak('I had trouble saving that item to the database.');
+      await session.audio.speak(
+        'I had trouble saving that item to the database.'
+      );
     }
   }
 
@@ -455,7 +531,10 @@ Rules:
 
       const expired = rows.filter((r: any) => r.is_expired).length;
       const soon = rows.filter(
-        (r: any) => !r.is_expired && r.days_until_expiry != null && r.days_until_expiry <= 7
+        (r: any) =>
+          !r.is_expired &&
+          r.days_until_expiry != null &&
+          r.days_until_expiry <= 7
       ).length;
 
       const preview = rows
@@ -463,7 +542,9 @@ Rules:
         .map((r: any) => {
           if (r.no_expiry_confirmed) return `${r.product_name}, no expiry`;
           if (r.is_expired) return `${r.product_name}, expired`;
-          if (r.days_until_expiry != null) return `${r.product_name}, ${r.days_until_expiry} days`;
+          if (r.days_until_expiry != null) {
+            return `${r.product_name}, ${r.days_until_expiry} days`;
+          }
           return `${r.product_name}, no date`;
         })
         .join('. ');
