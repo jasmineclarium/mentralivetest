@@ -1,15 +1,10 @@
 import MentraSDK from '@mentra/sdk';
-import express from 'express';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { Pool } from 'pg';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const { AppServer } = MentraSDK as any;
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -59,10 +54,10 @@ function calcExpiry(d: string) {
 
 function expiryLine(d: string) {
   const { isExpired, days } = calcExpiry(d);
-  if (isExpired) return `Warning! EXPIRED ${Math.abs(days)} days ago`;
-  if (days === 0) return 'Expiry today';
-  if (days <= 7) return `Expiry ${d}, only ${days} days left`;
-  return `Expiry ${d}, ${days} days remaining`;
+  if (isExpired) return `Warning! This product is EXPIRED. It expired ${Math.abs(days)} days ago.`;
+  if (days === 0) return `Expiry date ${d}. This expires today.`;
+  if (days <= 7) return `Expiry date ${d}. Caution, only ${days} days left.`;
+  return `Expiry date ${d}. Good for ${days} more days.`;
 }
 
 function dateFromSpeech(text: string): string | null {
@@ -199,7 +194,7 @@ class ProductScannerApp extends AppServer {
     });
   }
 
-  private async startScan(s: any, _sid: string, data: SessionData) {
+  private async startScan(session: any, _sessionId: string, data: SessionData) {
     if (data.phase !== 'idle') return;
 
     data.ext = {
@@ -209,16 +204,19 @@ class ProductScannerApp extends AppServer {
       expiryDate: null,
       noExpiryConfirmed: false,
     };
+
     data.announced = {
       product: false,
       barcode: false,
       expiry: false,
     };
+
     data.phase = 'scanning';
 
     try {
-      const st = await s.camera.startManagedStream({ quality: '720p' });
+      const st = await session.camera.startManagedStream({ quality: '720p' });
       data.hlsUrl = st.hlsUrl;
+
       await db.query(
         `INSERT INTO active_streams(user_id,hls_url,dash_url,started_at)
          VALUES($1,$2,$3,now())
@@ -226,37 +224,49 @@ class ProductScannerApp extends AppServer {
          DO UPDATE SET hls_url=$2,dash_url=$3,started_at=now()`,
         [data.userId, st.hlsUrl, st.dashUrl]
       );
-    } catch {}
+    } catch (err) {
+      console.error('Failed to start stream', err);
+    }
 
-    await s.audio.speak('Scanning started. Point your glasses at the product and rotate it slowly.');
-    this.startLoop(s, _sid, data);
+    await session.audio.speak('Scanning started. Point your glasses at the product and rotate it slowly.');
+    this.startLoop(session, _sessionId, data);
   }
 
-  private async stopScan(s: any, _: string, data: SessionData, announce: boolean) {
+  private async stopScan(session: any, _sessionId: string, data: SessionData, announce: boolean) {
     this.stopLoop(data);
+
     try {
-      await s.camera.stopManagedStream();
+      await session.camera.stopManagedStream();
     } catch {}
+
     await db.query('DELETE FROM active_streams WHERE user_id=$1', [data.userId]);
+
     data.phase = 'idle';
     data.hlsUrl = null;
-    if (announce) await s.audio.speak('Scan cancelled.');
+
+    if (announce) {
+      await session.audio.speak('Scan cancelled.');
+    }
   }
 
-  private async saveAndFinish(s: any, _sid: string, data: SessionData) {
+  private async saveAndFinish(session: any, _sessionId: string, data: SessionData) {
     if (data.phase !== 'scanning') return;
-    data.phase = 'saving';
 
+    data.phase = 'saving';
     this.stopLoop(data);
+
     try {
-      await s.camera.stopManagedStream();
+      await session.camera.stopManagedStream();
     } catch {}
+
     await db.query('DELETE FROM active_streams WHERE user_id=$1', [data.userId]);
 
     const ext = data.ext;
+
     if (!ext.productName) {
-      await s.audio.speak('Could not identify a product. Try again pointing at the label.');
+      await session.audio.speak('Could not identify a product. Try again pointing at the label.');
       data.phase = 'idle';
+      data.hlsUrl = null;
       return;
     }
 
@@ -283,33 +293,48 @@ class ProductScannerApp extends AppServer {
     );
 
     let tts = `Saved: ${ext.productName}`;
-    if (ext.manufacturer && ext.manufacturer !== 'Unknown') tts += ` by ${ext.manufacturer}`;
-    if (ext.barcode) tts += '. Barcode recorded';
-    if (ext.noExpiryConfirmed) tts += '. No expiration date.';
-    else if (expiry?.isExpired) tts += `. EXPIRED ${Math.abs(expiry.days)} days ago. Please discard.`;
-    else if (expiry && expiry.days <= 7) tts += `. Caution, expires in ${expiry.days} days.`;
-    else if (ext.expiryDate) tts += `. Good for ${expiry!.days} more days.`;
-    else tts += '. No expiration date found.';
 
-    await s.audio.speak(tts);
+    if (ext.manufacturer && ext.manufacturer !== 'Unknown') {
+      tts += ` by ${ext.manufacturer}`;
+    }
+
+    if (ext.barcode) {
+      tts += '. Barcode recorded';
+    }
+
+    if (ext.noExpiryConfirmed) {
+      tts += '. No expiration date.';
+    } else if (expiry?.isExpired) {
+      tts += `. EXPIRED ${Math.abs(expiry.days)} days ago. Please discard.`;
+    } else if (expiry && expiry.days <= 7) {
+      tts += `. Caution, expires in ${expiry.days} days.`;
+    } else if (ext.expiryDate && expiry) {
+      tts += `. Good for ${expiry.days} more days.`;
+    } else {
+      tts += '. No expiration date found.';
+    }
+
+    await session.audio.speak(tts);
+
     data.phase = 'idle';
     data.hlsUrl = null;
   }
 
-  private startLoop(s: any, sid: string, data: SessionData) {
+  private startLoop(session: any, sessionId: string, data: SessionData) {
     data.loopActive = true;
-    this.scheduleNext(s, sid, data);
+    this.scheduleNext(session, sessionId, data);
   }
 
   private stopLoop(data: SessionData) {
     data.loopActive = false;
+
     if (data.loopTimer) {
       clearTimeout(data.loopTimer);
       data.loopTimer = undefined;
     }
   }
 
-  private scheduleNext(s: any, sid: string, data: SessionData) {
+  private scheduleNext(session: any, sessionId: string, data: SessionData) {
     if (!data.loopActive || data.phase !== 'scanning') return;
 
     const { product, barcode, expiry } = data.announced;
@@ -317,33 +342,44 @@ class ProductScannerApp extends AppServer {
 
     data.loopTimer = setTimeout(async () => {
       if (!data.loopActive || data.phase !== 'scanning') return;
+
       try {
-        await this.analyzeFrame(s, data);
+        await this.analyzeFrame(session, data);
       } catch (e) {
-        s.logger.error(e as Error, 'Frame error');
+        if (session.logger?.error) {
+          session.logger.error(e as Error, 'Frame error');
+        } else {
+          console.error('Frame error', e);
+        }
       }
-      this.scheduleNext(s, sid, data);
+
+      this.scheduleNext(session, sessionId, data);
     }, delay);
   }
 
-  private async analyzeFrame(s: any, data: SessionData) {
-    const photo = await s.camera.requestPhoto({ compress: 'medium', size: 'large' });
+  private async analyzeFrame(session: any, data: SessionData) {
+    const photo = await session.camera.requestPhoto({ compress: 'medium', size: 'large' });
     const base64 = photo.buffer.toString('base64');
 
     const { product, barcode, expiry } = data.announced;
     const needExpiry = !expiry && !data.ext.noExpiryConfirmed;
+
     if (product && barcode && !needExpiry) return;
 
     const need: string[] = [];
-    if (!product) need.push('product name and manufacturer/brand');
+    if (!product) need.push('product name and manufacturer or brand');
     if (!barcode) need.push('barcode or QR code number');
     if (needExpiry) need.push('expiration, best by, or use by date');
 
     const prompt = `Analyze this product packaging.
 Extract ONLY clearly visible info.
 Looking for: ${need.join(', ')}.
-Reply ONLY with JSON: {"product_name":null,"manufacturer":null,"barcode":null,"expiry_date":null}
-Rules: expiry_date in YYYY-MM-DD; decode barcode number; null if not visible.`;
+Reply ONLY with JSON:
+{"product_name":null,"manufacturer":null,"barcode":null,"expiry_date":null}
+Rules:
+- expiry_date must be YYYY-MM-DD
+- decode barcode number if visible
+- use null if not visible`;
 
     const resp = await model.generateContent([
       { inlineData: { mimeType: 'image/jpeg', data: base64 } },
@@ -360,7 +396,9 @@ Rules: expiry_date in YYYY-MM-DD; decode barcode number; null if not visible.`;
       ext.productName = result.product_name;
       ext.manufacturer = result.manufacturer || null;
       data.announced.product = true;
-      toSay.push(`Product identified: ${result.product_name}${result.manufacturer ? ' by ' + result.manufacturer : ''}`);
+      toSay.push(
+        `Product identified: ${result.product_name}${result.manufacturer ? ' by ' + result.manufacturer : ''}`
+      );
     }
 
     if (!barcode && result.barcode) {
@@ -377,7 +415,11 @@ Rules: expiry_date in YYYY-MM-DD; decode barcode number; null if not visible.`;
 
     if (toSay.length > 0) {
       const stillNeed: string[] = [];
-      if (!data.announced.barcode) stillNeed.push('please show me the barcode');
+
+      if (!data.announced.barcode) {
+        stillNeed.push('please show me the barcode');
+      }
+
       if (!data.announced.expiry && !ext.noExpiryConfirmed) {
         stillNeed.push('show expiration date, speak it, or say no expiration date');
       }
@@ -388,13 +430,13 @@ Rules: expiry_date in YYYY-MM-DD; decode barcode number; null if not visible.`;
         toSay.push('All info captured. Say save or press the button.');
       }
 
-      await s.audio.speak(toSay.join('. '));
+      await session.audio.speak(toSay.join('. '));
     }
   }
 
-  private async readList(s: any, data: SessionData) {
+  private async readList(session: any, data: SessionData) {
     const { rows } = await db.query(
-      `SELECT product_name,is_expired,days_until_expiry,no_expiry_confirmed
+      `SELECT product_name, is_expired, days_until_expiry, no_expiry_confirmed
        FROM scanned_items
        WHERE user_id=$1
        ORDER BY scanned_at DESC
@@ -403,12 +445,15 @@ Rules: expiry_date in YYYY-MM-DD; decode barcode number; null if not visible.`;
     );
 
     if (!rows.length) {
-      await s.audio.speak('No items scanned yet.');
+      await session.audio.speak('No items scanned yet.');
       return;
     }
 
     const expired = rows.filter((r: any) => r.is_expired).length;
-    const soon = rows.filter((r: any) => !r.is_expired && r.days_until_expiry != null && r.days_until_expiry <= 7).length;
+    const soon = rows.filter(
+      (r: any) => !r.is_expired && r.days_until_expiry != null && r.days_until_expiry <= 7
+    ).length;
+
     const preview = rows
       .slice(0, 3)
       .map((r: any) => {
@@ -419,7 +464,9 @@ Rules: expiry_date in YYYY-MM-DD; decode barcode number; null if not visible.`;
       })
       .join('. ');
 
-    await s.audio.speak(`${rows.length} items. ${expired} expired, ${soon} expiring soon. ${preview}`);
+    await session.audio.speak(
+      `${rows.length} items. ${expired} expired, ${soon} expiring soon. ${preview}`
+    );
   }
 
   protected async onStop(sessionId: string, _userId: string, reason: string) {
@@ -428,40 +475,10 @@ Rules: expiry_date in YYYY-MM-DD; decode barcode number; null if not visible.`;
       this.stopLoop(data);
       this.sessions.delete(sessionId);
     }
+
     console.log(`Session ${sessionId} ended: ${reason}`);
   }
 }
-
-const webApp = express();
-
-webApp.use(express.static(path.join(process.cwd(), 'public')));
-
-webApp.get('/health', (_req, res) => {
-  res.status(200).send('ok');
-});
-
-webApp.get('/api/items', async (_req, res) => {
-  try {
-    const { rows } = await db.query(
-      `SELECT id, product_name, manufacturer, barcode, expiry_date,
-              is_expired, days_until_expiry, no_expiry_confirmed, scanned_at
-       FROM scanned_items
-       ORDER BY scanned_at DESC
-       LIMIT 50`
-    );
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
-  }
-});
-
-webApp.get('/', (_req, res) => {
-  res.sendFile(path.join(process.cwd(), 'public', 'index.html'));
-});
-
-webApp.get('/webview', (_req, res) => {
-  res.sendFile(path.join(process.cwd(), 'public', 'index.html'));
-});
 
 const app = new ProductScannerApp({
   packageName: process.env.MENTRA_PACKAGE_NAME!,
