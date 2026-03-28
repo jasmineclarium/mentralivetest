@@ -1,21 +1,24 @@
 {
   "name": "mentralivetest",
   "version": "1.0.0",
+  "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js"
+    "build": "tsc --noEmit",
+    "start": "tsx src/index.ts"
   },
   "dependencies": {
-    "@mentra/sdk": "latest",
     "@google/generative-ai": "^0.21.0",
+    "@mentra/sdk": "latest",
     "pg": "^8.12.0"
   },
   "devDependencies": {
-    "typescript": "^5.0.0",
-    "tsx": "^4.0.0",
     "@types/node": "^20.0.0",
-    "@types/pg": "^8.11.0"
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=20"
+  }
 }
