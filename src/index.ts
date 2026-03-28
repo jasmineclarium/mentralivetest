@@ -11,7 +11,7 @@ const db = new Pool({
 });
 
 const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const model = genai.getGenerativeModel({ model: 'gemini-2.0-flash' });
+const model = genai.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
 type ScanStep = 'idle' | 'front' | 'barcode' | 'expiry' | 'saving';
 
