@@ -113,9 +113,15 @@ function isNoExpiry(text: string) {
 class ProductScannerApp extends AppServer {
   private sessions = new Map<string, SessionData>();
 
-  constructor(config: { packageName: string; apiKey: string; port: number }) {
-    super(config);
-  }
+constructor(config: { packageName: string; apiKey: string; port: number }) {
+  super({
+    ...config,
+    subscriptions: {
+      transcription: true,
+      buttonPress: true,
+    },
+  });
+}
 
   protected async onSession(session: any, sessionId: string, userId: string) {
     const data: SessionData = {
