@@ -56,7 +56,7 @@ function isNoExpiry(t:string) { return t.includes('no expir')||t.includes('no da
 class ProductScannerApp extends AppServer {
   private sessions = new Map<string,SessionData>();
 
-  protected async onSession(session:AppSession, sessionId:string, userId:string) {
+  protected async onSession(session:any, sessionId:string, userId:string) {
     const data:SessionData = {phase:'idle',userId,ext:{productName:null,manufacturer:null,barcode:null,expiryDate:null,noExpiryConfirmed:false},announced:{product:false,barcode:false,expiry:false},loopActive:false,hlsUrl:null};
     this.sessions.set(sessionId,data);
     console.log(`Session started for user ${userId}`);
@@ -85,7 +85,7 @@ class ProductScannerApp extends AppServer {
     session.events.onDisconnected(()=>{this.stopLoop(data);this.sessions.delete(sessionId);});
   }
 
-  private async startScan(s:AppSession,sid:string,data:SessionData){
+  private async startScan(s:any,sid:string,data:SessionData){
     if(data.phase!=='idle')return;
     data.ext={productName:null,manufacturer:null,barcode:null,expiryDate:null,noExpiryConfirmed:false};
     data.announced={product:false,barcode:false,expiry:false}; data.phase='scanning';
@@ -93,12 +93,12 @@ class ProductScannerApp extends AppServer {
     await s.audio.speak('Scanning started. Point your glasses at the product and rotate it slowly.');
     this.startLoop(s,sid,data);
   }
-  private async stopScan(s:AppSession,_:string,data:SessionData,announce:boolean){
+  private async stopScan(s:any,_:string,data:SessionData,announce:boolean){
     this.stopLoop(data);try{await s.camera.stopManagedStream();}catch(e){}
     await db.query('DELETE FROM active_streams WHERE user_id=$1',[data.userId]);
     data.phase='idle';data.hlsUrl=null;if(announce)await s.audio.speak('Scan cancelled.');
   }
-  private async saveAndFinish(s:AppSession,sid:string,data:SessionData){
+  private async saveAndFinish(s:any,sid:string,data:SessionData){
     if(data.phase!=='scanning')return;data.phase='saving';
     this.stopLoop(data);try{await s.camera.stopManagedStream();}catch(e){}
     await db.query('DELETE FROM active_streams WHERE user_id=$1',[data.userId]);
@@ -116,15 +116,15 @@ class ProductScannerApp extends AppServer {
     else tts+='. No expiration date found.';
     await s.audio.speak(tts);data.phase='idle';data.hlsUrl=null;
   }
-  private startLoop(s:AppSession,sid:string,data:SessionData){data.loopActive=true;this.scheduleNext(s,sid,data);}
+  private startLoop(s:any,sid:string,data:SessionData){data.loopActive=true;this.scheduleNext(s,sid,data);}
   private stopLoop(data:SessionData){data.loopActive=false;if(data.loopTimer){clearTimeout(data.loopTimer);data.loopTimer=undefined;}}
-  private scheduleNext(s:AppSession,sid:string,data:SessionData){
+  private scheduleNext(s:any,sid:string,data:SessionData){
     if(!data.loopActive||data.phase!=='scanning')return;
     const{product,barcode,expiry}=data.announced;
     const delay=(product&&barcode&&expiry)?4000:(product&&barcode)?1000:2000;
     data.loopTimer=setTimeout(async()=>{if(!data.loopActive||data.phase!=='scanning')return;try{await this.analyzeFrame(s,data);}catch(e){s.logger.error(e as Error,'Frame error');}this.scheduleNext(s,sid,data);},delay);
   }
-  private async analyzeFrame(s:AppSession,data:SessionData){
+  private async analyzeFrame(s:any,data:SessionData){
     const photo=await s.camera.requestPhoto({compress:'medium',size:'large'});
     const base64=photo.buffer.toString('base64');
     const{product,barcode,expiry}=data.announced;
@@ -151,7 +151,7 @@ class ProductScannerApp extends AppServer {
       await s.audio.speak(toSay.join('. '));
     }
   }
-  private async readList(s:AppSession,data:SessionData){
+  private async readList(s:any,data:SessionData){
     const{rows}=await db.query('SELECT product_name,is_expired,days_until_expiry,no_expiry_confirmed FROM scanned_items WHERE user_id=$1 ORDER BY scanned_at DESC LIMIT 20',[data.userId]);
     if(!rows.length){await s.audio.speak('No items scanned yet.');return;}
     const expired=rows.filter((r:any)=>r.is_expired).length;
