@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Product Scanner</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f4f5f7;color:#1a1a2e;min-height:100vh}
+header{background:#0d1f3c;color:#fff;padding:16px 20px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10}
+.logo{width:36px;height:36px;background:#00e5cc;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+header h1{font-size:17px;font-weight:600}
+header p{font-size:12px;opacity:.7;margin-top:1px}
+.stats{display:flex;gap:8px;padding:16px 20px 8px;flex-wrap:wrap}
+.stat{background:#fff;border-radius:10px;padding:12px 16px;flex:1;min-width:80px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.stat-val{font-size:22px;font-weight:700;line-height:1}
+.stat-lbl{font-size:11px;color:#666;margin-top:3px}
+.stat.red .stat-val{color:#e53935}
+.stat.amber .stat-val{color:#f57c00}
+.stat.green .stat-val{color:#2e7d32}
+.filters{display:flex;gap:8px;padding:8px 20px;overflow-x:auto;scrollbar-width:none}
+.filters::-webkit-scrollbar{display:none}
+.filter-btn{white-space:nowrap;padding:6px 14px;border-radius:20px;border:1.5px solid #ddd;background:#fff;font-size:13px;cursor:pointer;transition:all .15s;color:#555}
+.filter-btn.active{background:#0d1f3c;border-color:#0d1f3c;color:#fff}
+.items{padding:8px 16px 80px;display:flex;flex-direction:column;gap:10px}
+.card{background:#fff;border-radius:12px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);border-left:4px solid #ddd;position:relative}
+.card.expired{border-left-color:#e53935}
+.card.expiring{border-left-color:#f57c00}
+.card.good{border-left-color:#2e7d32}
+.card.none{border-left-color:#90a4ae}
+.card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:8px}
+.item-name{font-size:15px;font-weight:600;color:#1a1a2e}
+.manufacturer{font-size:12px;color:#666;margin-top:2px}
+.badge{padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap;flex-shrink:0}
+.badge.expired{background:#fce4e4;color:#c62828}
+.badge.expiring{background:#fff3e0;color:#e65100}
+.badge.good{background:#e8f5e9;color:#1b5e20}
+.badge.none{background:#f1f3f4;color:#546e7a}
+.meta{display:flex;flex-wrap:wrap;gap:8px 16px}
+.meta-item{font-size:12px;color:#888}
+.meta-item span{color:#444;font-weight:500}
+.empty{text-align:center;padding:60px 20px;color:#aaa}
+.empty-icon{font-size:48px;margin-bottom:12px}
+.empty-title{font-size:16px;font-weight:600;color:#777;margin-bottom:6px}
+.loading{text-align:center;padding:40px;color:#888;font-size:14px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">&#128269;</div>
+  <div>
+    <h1>Product Scanner</h1>
+    <p>Scanned item log</p>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="stat"><div class="stat-val" id="s-total">-</div><div class="stat-lbl">Total</div></div>
+  <div class="stat red"><div class="stat-val" id="s-expired">-</div><div class="stat-lbl">Expired</div></div>
+  <div class="stat amber"><div class="stat-val" id="s-soon">-</div><div class="stat-lbl">Expiring soon</div></div>
+  <div class="stat green"><div class="stat-val" id="s-good">-</div><div class="stat-lbl">Good</div></div>
+</div>
+
+<div class="filters">
+  <button class="filter-btn active" data-filter="all" onclick="setFilter('all',this)">All</button>
+  <button class="filter-btn" data-filter="expired" onclick="setFilter('expired',this)">&#9888; Expired</button>
+  <button class="filter-btn" data-filter="expiring" onclick="setFilter('expiring',this)">&#8987; Expiring soon</button>
+  <button class="filter-btn" data-filter="good" onclick="setFilter('good',this)">&#10003; Good</button>
+  <button class="filter-btn" data-filter="none" onclick="setFilter('none',this)">No expiry</button>
+</div>
+
+<div class="items" id="items-list"><div class="loading">Loading...</div></div>
+
+<script>
+let all=[], filter='all';
+
+function status(item){
+  if(item.is_expired)return'expired';
+  if(item.no_expiry_confirmed||!item.expiry_date)return'none';
+  if(item.days_until_expiry!=null&&item.days_until_expiry<=7)return'expiring';
+  return'good';
+}
+function badge(item){
+  const s=status(item);
+  if(s==='expired')return'<span class="badge expired">Expired</span>';
+  if(s==='expiring')return`<span class="badge expiring">${item.days_until_expiry}d left</span>`;
+  if(s==='good')return`<span class="badge good">${item.days_until_expiry}d left</span>`;
+  return'<span class="badge none">No expiry</span>';
+}
+function fmt(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});}
+function fmtDate(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});}
+function fmtTime(iso){if(!iso)return'';const d=new Date(iso);return d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}
+
+function render(){
+  const filtered=all.filter(i=>filter==='all'||status(i)===filter);
+  const list=document.getElementById('items-list');
+  if(!filtered.length){list.innerHTML='<div class="empty"><div class="empty-icon">&#128247;</div><div class="empty-title">No items here</div><p>Scan products with your glasses to see them here.</p></div>';return;}
+  list.innerHTML=filtered.map(i=>`
+    <div class="card ${status(i)}">
+      <div class="card-top">
+        <div>
+          <div class="item-name">${i.product_name||'Unknown product'}</div>
+          <div class="manufacturer">${i.manufacturer||'Unknown manufacturer'}</div>
+        </div>
+        ${badge(i)}
+      </div>
+      <div class="meta">
+        <div class="meta-item">Expiry: <span>${fmtDate(i.expiry_date)}</span></div>
+        ${i.barcode?'<div class="meta-item">Barcode: <span>'+i.barcode+'</span></div>':''}
+        <div class="meta-item">Scanned: <span>${fmtTime(i.scanned_at)}</span></div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function updateStats(){
+  document.getElementById('s-total').textContent=all.length;
+  document.getElementById('s-expired').textContent=all.filter(i=>status(i)==='expired').length;
+  document.getElementById('s-soon').textContent=all.filter(i=>status(i)==='expiring').length;
+  document.getElementById('s-good').textContent=all.filter(i=>status(i)==='good').length;
+}
+
+function setFilter(f,btn){filter=f;document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');render();}
+
+async function load(){
+  try{
+    const r=await fetch('/api/items');
+    if(r.ok){all=await r.json();updateStats();render();}
+    else document.getElementById('items-list').innerHTML='<div class="loading">Could not load items.</div>';
+  }catch{document.getElementById('items-list').innerHTML='<div class="loading">Could not connect to server.</div>';}
+}
+
+load();
+setInterval(load,10000);
+</script>
+</body>
+</html>
