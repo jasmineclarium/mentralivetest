@@ -8,7 +8,6 @@
   },
   "dependencies": {
     "@mentra/sdk": "latest",
-    "@anthropic-ai/sdk": "^0.39.0",
     "@google/genai": "^1.0.0",
     "pg": "^8.12.0"
   },
