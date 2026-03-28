@@ -54,35 +54,91 @@ function isNoExpiry(t:string) { return t.includes('no expir')||t.includes('no da
 
 // ── App ───────────────────────────────────────────────────────────────────
 class ProductScannerApp extends AppServer {
-  private sessions = new Map<string,SessionData>();
+  private sessions = new Map();
 
-  protected async onSession(session:any, sessionId:string, userId:string) {
-    const data:SessionData = {phase:'idle',userId,ext:{productName:null,manufacturer:null,barcode:null,expiryDate:null,noExpiryConfirmed:false},announced:{product:false,barcode:false,expiry:false},loopActive:false,hlsUrl:null};
-    this.sessions.set(sessionId,data);
+  constructor(config: { packageName: string; apiKey: string; port: number }) {
+    super(config);
+  }
+
+  protected async onSession(session: any, sessionId: string, userId: string) {
+    const data: SessionData = {
+      phase: 'idle',
+      userId,
+      ext: {
+        productName: null,
+        manufacturer: null,
+        barcode: null,
+        expiryDate: null,
+        noExpiryConfirmed: false,
+      },
+      announced: {
+        product: false,
+        barcode: false,
+        expiry: false,
+      },
+      loopActive: false,
+      hlsUrl: null,
+    };
+
+    this.sessions.set(sessionId, data);
     console.log(`Session started for user ${userId}`);
+
     await session.audio.speak('Product scanner ready. Say scan or press the button to start.');
 
-    session.events.onTranscription(async(t)=>{
-      if(!t.isFinal)return;
-      const text=t.text.toLowerCase().trim();
-      if(data.phase==='idle'){
-        if(text.includes('scan')||text.includes('start'))await this.startScan(session,sessionId,data);
-        else if(text.includes('list')||text.includes('history'))await this.readList(session,data);
+    session.events.onTranscription(async (t: any) => {
+      if (!t.isFinal) return;
+      const text = t.text.toLowerCase().trim();
+
+      if (data.phase === 'idle') {
+        if (text.includes('scan') || text.includes('start')) {
+          await this.startScan(session, sessionId, data);
+        } else if (text.includes('list') || text.includes('history')) {
+          await this.readList(session, data);
+        }
         return;
       }
-      if(data.phase==='scanning'){
-        if(isNoExpiry(text)){data.ext.noExpiryConfirmed=true;await session.audio.speak('No expiration date. Saving now.');await this.saveAndFinish(session,sessionId,data);}
-        else{const d=dateFromSpeech(text);if(d){data.ext.expiryDate=d;data.announced.expiry=true;await session.audio.speak(`${expiryLine(d)}. Saving now.`);await this.saveAndFinish(session,sessionId,data);}
-        else if(text.includes('save')||text.includes('done'))await this.saveAndFinish(session,sessionId,data);
-        else if(text.includes('cancel')||text.includes('stop'))await this.stopScan(session,sessionId,data,true);}
+
+      if (data.phase === 'scanning') {
+        if (isNoExpiry(text)) {
+          data.ext.noExpiryConfirmed = true;
+          await session.audio.speak('No expiration date. Saving now.');
+          await this.saveAndFinish(session, sessionId, data);
+        } else {
+          const d = dateFromSpeech(text);
+          if (d) {
+            data.ext.expiryDate = d;
+            data.announced.expiry = true;
+            await session.audio.speak(`${expiryLine(d)}. Saving now.`);
+            await this.saveAndFinish(session, sessionId, data);
+          } else if (text.includes('save') || text.includes('done')) {
+            await this.saveAndFinish(session, sessionId, data);
+          } else if (text.includes('cancel') || text.includes('stop')) {
+            await this.stopScan(session, sessionId, data, true);
+          }
+        }
       }
     });
 
-    session.events.onButtonPress(async(btn)=>{
-      if(btn.pressType==='short'){if(data.phase==='idle')await this.startScan(session,sessionId,data);else if(data.phase==='scanning')await this.saveAndFinish(session,sessionId,data);}
-      else if(btn.pressType==='long'){if(data.phase==='scanning')await this.stopScan(session,sessionId,data,true);else await this.readList(session,data);}
+    session.events.onButtonPress(async (btn: any) => {
+      if (btn.pressType === 'short') {
+        if (data.phase === 'idle') {
+          await this.startScan(session, sessionId, data);
+        } else if (data.phase === 'scanning') {
+          await this.saveAndFinish(session, sessionId, data);
+        }
+      } else if (btn.pressType === 'long') {
+        if (data.phase === 'scanning') {
+          await this.stopScan(session, sessionId, data, true);
+        } else {
+          await this.readList(session, data);
+        }
+      }
     });
-    session.events.onDisconnected(()=>{this.stopLoop(data);this.sessions.delete(sessionId);});
+
+    session.events.onDisconnected(() => {
+      this.stopLoop(data);
+      this.sessions.delete(sessionId);
+    });
   }
 
   private async startScan(s:any,sid:string,data:SessionData){
