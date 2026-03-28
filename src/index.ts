@@ -463,10 +463,6 @@ webApp.get('/webview', (_req, res) => {
   res.sendFile(path.join(process.cwd(), 'public', 'index.html'));
 });
 
-webApp.listen(PORT, () => {
-  console.log(`Webview server running on port ${PORT}`);
-});
-
 const app = new ProductScannerApp({
   packageName: process.env.MENTRA_PACKAGE_NAME!,
   apiKey: process.env.MENTRA_API_KEY!,
