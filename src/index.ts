@@ -38,9 +38,6 @@ webApp.get('/', async (req, res) => {
     </table></body></html>`);
   } catch(e) { res.status(500).send('DB error: '+(e as any).message); }
 });
-webApp.listen(parseInt(process.env.PORT||'3000'), () => {
-  console.log(`Dashboard running on port ${process.env.PORT||3000}`);
-});
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface Extraction { productName:string|null; manufacturer:string|null; barcode:string|null; expiryDate:string|null; noExpiryConfirmed:boolean; }
