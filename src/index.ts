@@ -1,4 +1,8 @@
-import { AppServer, AppSession } from '@mentra/sdk';
+import MentraSDK from '@mentra/sdk';
+import { Pool } from 'pg';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+const { AppServer } = MentraSDK as any;
 import { Pool } from 'pg';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import express from 'express';
