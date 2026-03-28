@@ -13,6 +13,8 @@ const db = new Pool({
 const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genai.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
+type ScanStep = 'idle' | 'front' | 'barcode' | 'expiry' | 'saving';
+
 type Extraction = {
   productName: string | null;
   manufacturer: string | null;
@@ -22,23 +24,16 @@ type Extraction = {
 };
 
 type SessionData = {
-  phase: 'idle' | 'scanning' | 'saving';
   userId: string;
+  step: ScanStep;
   ext: Extraction;
-  announced: {
-    product: boolean;
-    barcode: boolean;
-    expiry: boolean;
-  };
-  loopActive: boolean;
-  loopTimer?: NodeJS.Timeout;
   hlsUrl: string | null;
 };
 
 function parseJSON(text: string) {
   try {
-    const m = text.match(/\{[\s\S]*\}/);
-    return m ? JSON.parse(m[0]) : null;
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : null;
   } catch {
     return null;
   }
@@ -96,14 +91,24 @@ function dateFromSpeech(text: string): string | null {
   return null;
 }
 
-function isNoExpiry(t: string) {
+function isNoExpiry(text: string) {
   return (
-    t.includes('no expir') ||
-    t.includes('no date') ||
-    t.includes('no best by') ||
-    t.includes('does not have') ||
-    (t.includes('no') && t.includes('date'))
+    text.includes('no expir') ||
+    text.includes('no date') ||
+    text.includes('no best by') ||
+    text.includes('does not have') ||
+    (text.includes('no') && text.includes('date'))
   );
+}
+
+function resetExtraction(): Extraction {
+  return {
+    productName: null,
+    manufacturer: null,
+    barcode: null,
+    expiryDate: null,
+    noExpiryConfirmed: false,
+  };
 }
 
 class ProductScannerApp extends AppServer {
@@ -115,21 +120,9 @@ class ProductScannerApp extends AppServer {
 
   protected async onSession(session: any, sessionId: string, userId: string) {
     const data: SessionData = {
-      phase: 'idle',
       userId,
-      ext: {
-        productName: null,
-        manufacturer: null,
-        barcode: null,
-        expiryDate: null,
-        noExpiryConfirmed: false,
-      },
-      announced: {
-        product: false,
-        barcode: false,
-        expiry: false,
-      },
-      loopActive: false,
+      step: 'idle',
+      ext: resetExtraction(),
       hlsUrl: null,
     };
 
@@ -141,341 +134,351 @@ class ProductScannerApp extends AppServer {
     session.events.onTranscription(async (t: any) => {
       if (!t.isFinal) return;
       const text = t.text.toLowerCase().trim();
+      console.log('Final transcription:', text);
 
-      if (data.phase === 'idle') {
+      if (text.includes('cancel') || text.includes('stop')) {
+        await this.cancelFlow(session, data);
+        return;
+      }
+
+      if (data.step === 'idle') {
         if (text.includes('scan') || text.includes('start')) {
-          await this.startScan(session, sessionId, data);
+          await this.beginFlow(session, data);
         } else if (text.includes('list') || text.includes('history')) {
           await this.readList(session, data);
         }
         return;
       }
 
-      if (data.phase === 'scanning') {
+      if (data.step === 'expiry') {
         if (isNoExpiry(text)) {
           data.ext.noExpiryConfirmed = true;
-          await session.audio.speak('No expiration date. Saving now.');
-          await this.saveAndFinish(session, sessionId, data);
-        } else {
-          const d = dateFromSpeech(text);
-          if (d) {
-            data.ext.expiryDate = d;
-            data.announced.expiry = true;
-            await session.audio.speak(`${expiryLine(d)}. Saving now.`);
-            await this.saveAndFinish(session, sessionId, data);
-          } else if (text.includes('save') || text.includes('done')) {
-            await this.saveAndFinish(session, sessionId, data);
-          } else if (text.includes('cancel') || text.includes('stop')) {
-            await this.stopScan(session, sessionId, data, true);
-          }
+          await session.audio.speak('No expiration date noted. Saving now.');
+          await this.saveItem(session, data);
+          return;
         }
+
+        const d = dateFromSpeech(text);
+        if (d) {
+          data.ext.expiryDate = d;
+          await session.audio.speak(`${expiryLine(d)} Saving now.`);
+          await this.saveItem(session, data);
+          return;
+        }
+      }
+
+      if (text.includes('save')) {
+        await this.saveItem(session, data);
       }
     });
 
     session.events.onButtonPress(async (btn: any) => {
-      if (btn.pressType === 'short') {
-        if (data.phase === 'idle') {
-          await this.startScan(session, sessionId, data);
-        } else if (data.phase === 'scanning') {
-          await this.saveAndFinish(session, sessionId, data);
-        }
-      } else if (btn.pressType === 'long') {
-        if (data.phase === 'scanning') {
-          await this.stopScan(session, sessionId, data, true);
-        } else {
+      console.log('Button press:', btn.pressType);
+
+      if (btn.pressType === 'long') {
+        if (data.step === 'idle') {
           await this.readList(session, data);
+        } else {
+          await this.cancelFlow(session, data);
         }
+        return;
+      }
+
+      if (btn.pressType !== 'short') return;
+
+      if (data.step === 'idle') {
+        await this.beginFlow(session, data);
+        return;
+      }
+
+      if (data.step === 'front') {
+        await this.captureFrontLabel(session, data);
+        return;
+      }
+
+      if (data.step === 'barcode') {
+        await this.captureBarcode(session, data);
+        return;
+      }
+
+      if (data.step === 'expiry') {
+        await this.captureExpiry(session, data);
       }
     });
 
     session.events.onDisconnected(() => {
-      this.stopLoop(data);
       this.sessions.delete(sessionId);
     });
   }
 
-  private async startScan(session: any, _sessionId: string, data: SessionData) {
-    if (data.phase !== 'idle') return;
-
-    data.ext = {
-      productName: null,
-      manufacturer: null,
-      barcode: null,
-      expiryDate: null,
-      noExpiryConfirmed: false,
-    };
-
-    data.announced = {
-      product: false,
-      barcode: false,
-      expiry: false,
-    };
-
-    data.phase = 'scanning';
-
-    try {
-      const st = await session.camera.startManagedStream({ quality: '720p' });
-      data.hlsUrl = st.hlsUrl;
-
-      await db.query(
-        `INSERT INTO active_streams(user_id,hls_url,dash_url,started_at)
-         VALUES($1,$2,$3,now())
-         ON CONFLICT(user_id)
-         DO UPDATE SET hls_url=$2,dash_url=$3,started_at=now()`,
-        [data.userId, st.hlsUrl, st.dashUrl]
-      );
-    } catch (err) {
-      console.error('Failed to start stream', err);
-    }
-
-    await session.audio.speak('Scanning started. Point your glasses at the product and rotate it slowly.');
-    this.startLoop(session, _sessionId, data);
-  }
-
-  private async stopScan(session: any, _sessionId: string, data: SessionData, announce: boolean) {
-    this.stopLoop(data);
-
-    try {
-      await session.camera.stopManagedStream();
-    } catch {}
-
-    await db.query('DELETE FROM active_streams WHERE user_id=$1', [data.userId]);
-
-    data.phase = 'idle';
-    data.hlsUrl = null;
-
-    if (announce) {
-      await session.audio.speak('Scan cancelled.');
-    }
-  }
-
-  private async saveAndFinish(session: any, _sessionId: string, data: SessionData) {
-    if (data.phase !== 'scanning') return;
-
-    data.phase = 'saving';
-    this.stopLoop(data);
-
-    try {
-      await session.camera.stopManagedStream();
-    } catch {}
-
-    await db.query('DELETE FROM active_streams WHERE user_id=$1', [data.userId]);
-
-    const ext = data.ext;
-
-    if (!ext.productName) {
-      await session.audio.speak('Could not identify a product. Try again pointing at the label.');
-      data.phase = 'idle';
-      data.hlsUrl = null;
-      return;
-    }
-
-    const expiry = ext.expiryDate ? calcExpiry(ext.expiryDate) : null;
-
-    await db.query(
-      `INSERT INTO scanned_items(
-        user_id, scanned_at, product_name, manufacturer, barcode,
-        expiry_date, is_expired, days_until_expiry,
-        no_expiry_confirmed, stream_hls_url
-      )
-      VALUES($1,now(),$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [
-        data.userId,
-        ext.productName,
-        ext.manufacturer || 'Unknown',
-        ext.barcode,
-        ext.expiryDate,
-        expiry?.isExpired ?? null,
-        expiry?.days ?? null,
-        ext.noExpiryConfirmed,
-        data.hlsUrl,
-      ]
+  private async beginFlow(session: any, data: SessionData) {
+    data.ext = resetExtraction();
+    data.step = 'front';
+    await session.audio.speak(
+      'Starting scan. Hold the front label still in view, then press the button to capture the product image.'
     );
-
-    let tts = `Saved: ${ext.productName}`;
-
-    if (ext.manufacturer && ext.manufacturer !== 'Unknown') {
-      tts += ` by ${ext.manufacturer}`;
-    }
-
-    if (ext.barcode) {
-      tts += '. Barcode recorded';
-    }
-
-    if (ext.noExpiryConfirmed) {
-      tts += '. No expiration date.';
-    } else if (expiry?.isExpired) {
-      tts += `. EXPIRED ${Math.abs(expiry.days)} days ago. Please discard.`;
-    } else if (expiry && expiry.days <= 7) {
-      tts += `. Caution, expires in ${expiry.days} days.`;
-    } else if (ext.expiryDate && expiry) {
-      tts += `. Good for ${expiry.days} more days.`;
-    } else {
-      tts += '. No expiration date found.';
-    }
-
-    await session.audio.speak(tts);
-
-    data.phase = 'idle';
-    data.hlsUrl = null;
   }
 
-  private startLoop(session: any, sessionId: string, data: SessionData) {
-    data.loopActive = true;
-    this.scheduleNext(session, sessionId, data);
+  private async cancelFlow(session: any, data: SessionData) {
+    data.step = 'idle';
+    data.ext = resetExtraction();
+    await session.audio.speak('Scan cancelled.');
   }
 
-  private stopLoop(data: SessionData) {
-    data.loopActive = false;
-
-    if (data.loopTimer) {
-      clearTimeout(data.loopTimer);
-      data.loopTimer = undefined;
-    }
-  }
-
-  private scheduleNext(session: any, sessionId: string, data: SessionData) {
-    if (!data.loopActive || data.phase !== 'scanning') return;
-
-    const { product, barcode, expiry } = data.announced;
-    const delay = product && barcode && expiry ? 4000 : product && barcode ? 1000 : 2000;
-
-    data.loopTimer = setTimeout(async () => {
-      if (!data.loopActive || data.phase !== 'scanning') return;
-
-      try {
-        await this.analyzeFrame(session, data);
-      } catch (e) {
-        if (session.logger?.error) {
-          session.logger.error(e as Error, 'Frame error');
-        } else {
-          console.error('Frame error', e);
-        }
-      }
-
-      this.scheduleNext(session, sessionId, data);
-    }, delay);
-  }
-
-  private async analyzeFrame(session: any, data: SessionData) {
+  private async takePhoto(session: any, label: string) {
+    console.log(`Capturing photo for step: ${label}`);
     const photo = await session.camera.requestPhoto({ compress: 'medium', size: 'large' });
+
+    console.log('Photo captured', {
+      step: label,
+      bytes: photo?.buffer?.length,
+      hasBuffer: !!photo?.buffer,
+    });
+
     const base64 = photo.buffer.toString('base64');
+    return base64;
+  }
 
-    const { product, barcode, expiry } = data.announced;
-    const needExpiry = !expiry && !data.ext.noExpiryConfirmed;
-
-    if (product && barcode && !needExpiry) return;
-
-    const need: string[] = [];
-    if (!product) need.push('product name and manufacturer or brand');
-    if (!barcode) need.push('barcode or QR code number');
-    if (needExpiry) need.push('expiration, best by, or use by date');
-
-    const prompt = `Analyze this product packaging.
-Extract ONLY clearly visible info.
-Looking for: ${need.join(', ')}.
-Reply ONLY with JSON:
-{"product_name":null,"manufacturer":null,"barcode":null,"expiry_date":null}
-Rules:
-- expiry_date must be YYYY-MM-DD
-- decode barcode number if visible
-- use null if not visible`;
+  private async runGemini(prompt: string, base64: string, label: string) {
+    console.log(`Sending image to Gemini for step: ${label}`);
+    console.log('Prompt:', prompt);
 
     const resp = await model.generateContent([
       { inlineData: { mimeType: 'image/jpeg', data: base64 } },
       prompt,
     ]);
 
-    const result = parseJSON(resp.response.text());
-    if (!result) return;
+    const text = resp.response.text();
+    console.log(`Gemini raw response for ${label}:`, text);
 
-    const toSay: string[] = [];
-    const ext = data.ext;
+    const parsed = parseJSON(text);
+    console.log(`Gemini parsed response for ${label}:`, parsed);
 
-    if (!product && result.product_name) {
-      ext.productName = result.product_name;
-      ext.manufacturer = result.manufacturer || null;
-      data.announced.product = true;
-      toSay.push(
-        `Product identified: ${result.product_name}${result.manufacturer ? ' by ' + result.manufacturer : ''}`
+    return parsed;
+  }
+
+  private async captureFrontLabel(session: any, data: SessionData) {
+    await session.audio.speak('Photo captured. Checking front label.');
+
+    try {
+      const base64 = await this.takePhoto(session, 'front');
+
+      const prompt = `Analyze this product package front label.
+Extract ONLY clearly visible info.
+Reply ONLY with JSON:
+{"product_name":null,"manufacturer":null}
+Rules:
+- product_name should be the main product name
+- manufacturer should be the brand or maker
+- use null if unclear`;
+
+      const result = await this.runGemini(prompt, base64, 'front');
+
+      if (!result || !result.product_name) {
+        await session.audio.speak(
+          'I could not identify the product yet. Please hold the front label steady, closer to the glasses, and press the button again.'
+        );
+        return;
+      }
+
+      data.ext.productName = result.product_name;
+      data.ext.manufacturer = result.manufacturer || null;
+      data.step = 'barcode';
+
+      await session.audio.speak(
+        `I found ${result.product_name}${result.manufacturer ? ' by ' + result.manufacturer : ''}. Now show the barcode and press the button.`
       );
+    } catch (err) {
+      console.error('Front label capture failed:', err);
+      await session.audio.speak('I had trouble reading that image. Please try again.');
     }
+  }
 
-    if (!barcode && result.barcode) {
-      ext.barcode = result.barcode;
-      data.announced.barcode = true;
-      toSay.push('Barcode scanned');
-    }
+  private async captureBarcode(session: any, data: SessionData) {
+    await session.audio.speak('Photo captured. Checking barcode.');
 
-    if (needExpiry && result.expiry_date) {
-      ext.expiryDate = result.expiry_date;
-      data.announced.expiry = true;
-      toSay.push(expiryLine(result.expiry_date));
-    }
+    try {
+      const base64 = await this.takePhoto(session, 'barcode');
 
-    if (toSay.length > 0) {
-      const stillNeed: string[] = [];
+      const prompt = `Analyze this image for a product barcode or QR code.
+Extract ONLY clearly visible info.
+Reply ONLY with JSON:
+{"barcode":null}
+Rules:
+- barcode should be the decoded numeric or alphanumeric value if visible
+- use null if not readable`;
 
-      if (!data.announced.barcode) {
-        stillNeed.push('please show me the barcode');
+      const result = await this.runGemini(prompt, base64, 'barcode');
+
+      if (!result || !result.barcode) {
+        await session.audio.speak(
+          'I could not read the barcode. Please center the barcode, hold it still, and press the button again.'
+        );
+        return;
       }
 
-      if (!data.announced.expiry && !ext.noExpiryConfirmed) {
-        stillNeed.push('show expiration date, speak it, or say no expiration date');
+      data.ext.barcode = result.barcode;
+      data.step = 'expiry';
+
+      await session.audio.speak(
+        'Barcode captured. Now show the expiration date and press the button. Or say no expiration date.'
+      );
+    } catch (err) {
+      console.error('Barcode capture failed:', err);
+      await session.audio.speak('I had trouble reading that barcode image. Please try again.');
+    }
+  }
+
+  private async captureExpiry(session: any, data: SessionData) {
+    await session.audio.speak('Photo captured. Checking expiration date.');
+
+    try {
+      const base64 = await this.takePhoto(session, 'expiry');
+
+      const prompt = `Analyze this image for an expiration date, best by date, or use by date.
+Extract ONLY clearly visible info.
+Reply ONLY with JSON:
+{"expiry_date":null}
+Rules:
+- expiry_date must be YYYY-MM-DD
+- use null if not readable`;
+
+      const result = await this.runGemini(prompt, base64, 'expiry');
+
+      if (!result || !result.expiry_date) {
+        await session.audio.speak(
+          'I could not read an expiration date. Please hold the date closer and steadier, press the button again, or say no expiration date.'
+        );
+        return;
       }
 
-      if (stillNeed.length > 0 && ext.productName) {
-        toSay.push(stillNeed.join('. '));
-      } else if (data.announced.product && data.announced.barcode && data.announced.expiry) {
-        toSay.push('All info captured. Say save or press the button.');
+      data.ext.expiryDate = result.expiry_date;
+      await session.audio.speak(`${expiryLine(result.expiry_date)} Saving now.`);
+      await this.saveItem(session, data);
+    } catch (err) {
+      console.error('Expiry capture failed:', err);
+      await session.audio.speak('I had trouble reading that date image. Please try again.');
+    }
+  }
+
+  private async saveItem(session: any, data: SessionData) {
+    if (!data.ext.productName) {
+      await session.audio.speak('I do not have a product name yet, so I cannot save this item.');
+      return;
+    }
+
+    data.step = 'saving';
+
+    const ext = data.ext;
+    const expiry = ext.expiryDate ? calcExpiry(ext.expiryDate) : null;
+
+    console.log('Saving item to database:', {
+      userId: data.userId,
+      productName: ext.productName,
+      manufacturer: ext.manufacturer,
+      barcode: ext.barcode,
+      expiryDate: ext.expiryDate,
+      noExpiryConfirmed: ext.noExpiryConfirmed,
+      isExpired: expiry?.isExpired ?? null,
+      daysUntilExpiry: expiry?.days ?? null,
+    });
+
+    try {
+      await db.query(
+        `INSERT INTO scanned_items(
+          user_id, scanned_at, product_name, manufacturer, barcode,
+          expiry_date, is_expired, days_until_expiry,
+          no_expiry_confirmed, stream_hls_url
+        )
+        VALUES($1, now(), $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          data.userId,
+          ext.productName,
+          ext.manufacturer || 'Unknown',
+          ext.barcode,
+          ext.expiryDate,
+          expiry?.isExpired ?? null,
+          expiry?.days ?? null,
+          ext.noExpiryConfirmed,
+          null,
+        ]
+      );
+
+      let tts = `Saved: ${ext.productName}`;
+
+      if (ext.manufacturer && ext.manufacturer !== 'Unknown') {
+        tts += ` by ${ext.manufacturer}`;
       }
 
-      await session.audio.speak(toSay.join('. '));
+      if (ext.barcode) {
+        tts += '. Barcode recorded';
+      }
+
+      if (ext.noExpiryConfirmed) {
+        tts += '. No expiration date.';
+      } else if (expiry?.isExpired) {
+        tts += `. EXPIRED ${Math.abs(expiry.days)} days ago. Please discard.`;
+      } else if (expiry && expiry.days <= 7) {
+        tts += `. Caution, expires in ${expiry.days} days.`;
+      } else if (ext.expiryDate && expiry) {
+        tts += `. Good for ${expiry.days} more days.`;
+      } else {
+        tts += '. No expiration date found.';
+      }
+
+      data.step = 'idle';
+      data.ext = resetExtraction();
+
+      await session.audio.speak(tts);
+    } catch (err) {
+      console.error('Database save failed:', err);
+      data.step = 'idle';
+      await session.audio.speak('I had trouble saving that item to the database.');
     }
   }
 
   private async readList(session: any, data: SessionData) {
-    const { rows } = await db.query(
-      `SELECT product_name, is_expired, days_until_expiry, no_expiry_confirmed
-       FROM scanned_items
-       WHERE user_id=$1
-       ORDER BY scanned_at DESC
-       LIMIT 20`,
-      [data.userId]
-    );
+    try {
+      const { rows } = await db.query(
+        `SELECT product_name, is_expired, days_until_expiry, no_expiry_confirmed
+         FROM scanned_items
+         WHERE user_id = $1
+         ORDER BY scanned_at DESC
+         LIMIT 20`,
+        [data.userId]
+      );
 
-    if (!rows.length) {
-      await session.audio.speak('No items scanned yet.');
-      return;
+      if (!rows.length) {
+        await session.audio.speak('No items scanned yet.');
+        return;
+      }
+
+      const expired = rows.filter((r: any) => r.is_expired).length;
+      const soon = rows.filter(
+        (r: any) => !r.is_expired && r.days_until_expiry != null && r.days_until_expiry <= 7
+      ).length;
+
+      const preview = rows
+        .slice(0, 3)
+        .map((r: any) => {
+          if (r.no_expiry_confirmed) return `${r.product_name}, no expiry`;
+          if (r.is_expired) return `${r.product_name}, expired`;
+          if (r.days_until_expiry != null) return `${r.product_name}, ${r.days_until_expiry} days`;
+          return `${r.product_name}, no date`;
+        })
+        .join('. ');
+
+      await session.audio.speak(
+        `${rows.length} items. ${expired} expired, ${soon} expiring soon. ${preview}`
+      );
+    } catch (err) {
+      console.error('Read list failed:', err);
+      await session.audio.speak('I had trouble loading scanned items.');
     }
-
-    const expired = rows.filter((r: any) => r.is_expired).length;
-    const soon = rows.filter(
-      (r: any) => !r.is_expired && r.days_until_expiry != null && r.days_until_expiry <= 7
-    ).length;
-
-    const preview = rows
-      .slice(0, 3)
-      .map((r: any) => {
-        if (r.no_expiry_confirmed) return `${r.product_name}, no expiry`;
-        if (r.is_expired) return `${r.product_name}, expired`;
-        if (r.days_until_expiry != null) return `${r.product_name}, ${r.days_until_expiry} days`;
-        return `${r.product_name}, no date`;
-      })
-      .join('. ');
-
-    await session.audio.speak(
-      `${rows.length} items. ${expired} expired, ${soon} expiring soon. ${preview}`
-    );
   }
 
   protected async onStop(sessionId: string, _userId: string, reason: string) {
-    const data = this.sessions.get(sessionId);
-    if (data) {
-      this.stopLoop(data);
-      this.sessions.delete(sessionId);
-    }
-
+    this.sessions.delete(sessionId);
     console.log(`Session ${sessionId} ended: ${reason}`);
   }
 }
