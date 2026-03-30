@@ -13,7 +13,13 @@ const db = new Pool({
 const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genai.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-type AppState = 'idle' | 'collecting' | 'review' | 'saving';
+type AppState = 'idle' | 'collecting' | 'reviewing' | 'ready' | 'saving';
+
+type CapturedImage = {
+  base64: string;
+  mimeType: string;
+  capturedAt: string;
+};
 
 type ExtractedRecord = {
   productName: string | null;
@@ -23,17 +29,11 @@ type ExtractedRecord = {
   unavailableFields: string[];
 };
 
-type CapturedImage = {
-  base64: string;
-  mimeType: string;
-  capturedAt: string;
-};
-
 type SessionData = {
   userId: string;
   state: AppState;
   images: CapturedImage[];
-  merged: ExtractedRecord;
+  record: ExtractedRecord;
 };
 
 const REQUIRED_FIELDS: Array<keyof Omit<ExtractedRecord, 'unavailableFields'>> = [
@@ -54,9 +54,9 @@ function emptyRecord(): ExtractedRecord {
 }
 
 function resetItem(data: SessionData) {
-  data.images = [];
-  data.merged = emptyRecord();
   data.state = 'idle';
+  data.images = [];
+  data.record = emptyRecord();
 }
 
 function parseJSON(text: string) {
@@ -70,9 +70,9 @@ function parseJSON(text: string) {
 
 function calcExpiry(d: string) {
   const ex = new Date(d);
-  const t = new Date();
-  t.setHours(0, 0, 0, 0);
-  const days = Math.round((ex.getTime() - t.getTime()) / 86400000);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Math.round((ex.getTime() - today.getTime()) / 86400000);
   return { isExpired: days < 0, days };
 }
 
@@ -83,19 +83,25 @@ function missingFields(record: ExtractedRecord) {
   });
 }
 
-function compactFieldLabel(field: string) {
+function fieldLabel(field: string) {
   switch (field) {
     case 'productName':
-      return 'Product';
+      return 'product';
     case 'vendorName':
-      return 'Vendor';
+      return 'vendor';
     case 'countryOfOrigin':
-      return 'Origin';
+      return 'origin';
     case 'expirationDate':
-      return 'Expiry';
+      return 'expiration';
     default:
       return field;
   }
+}
+
+function shortMissingMessage(record: ExtractedRecord) {
+  const missing = missingFields(record);
+  if (!missing.length) return 'Ready to save.';
+  return `Missing ${missing.map(fieldLabel).join(', ')}.`;
 }
 
 function dateFromSpeech(text: string): string | null {
@@ -134,6 +140,34 @@ function dateFromSpeech(text: string): string | null {
   return null;
 }
 
+function parseUnavailableField(text: string): keyof Omit<ExtractedRecord, 'unavailableFields'> | null {
+  const lower = text.toLowerCase();
+
+  if (!(lower.includes('not available') || lower.includes('unknown') || lower.includes('not on package'))) {
+    return null;
+  }
+
+  if (lower.includes('vendor') || lower.includes('manufacturer') || lower.includes('brand')) {
+    return 'vendorName';
+  }
+  if (lower.includes('product') || lower.includes('name')) {
+    return 'productName';
+  }
+  if (lower.includes('origin') || lower.includes('country')) {
+    return 'countryOfOrigin';
+  }
+  if (
+    lower.includes('expiration') ||
+    lower.includes('expiry') ||
+    lower.includes('best by') ||
+    lower.includes('bb')
+  ) {
+    return 'expirationDate';
+  }
+
+  return null;
+}
+
 function parseManualField(text: string): Partial<ExtractedRecord> | null {
   const lower = text.toLowerCase().trim();
 
@@ -149,7 +183,7 @@ function parseManualField(text: string): Partial<ExtractedRecord> | null {
     return { expirationDate: expiry };
   }
 
-  const vendorMatch = lower.match(/(?:vendor|seller|manufacturer|brand)\s+(?:is\s+)?(.+)/);
+  const vendorMatch = lower.match(/(?:vendor|manufacturer|brand|seller)\s+(?:is\s+)?(.+)/);
   if (vendorMatch) {
     return { vendorName: vendorMatch[1].trim() };
   }
@@ -167,27 +201,26 @@ function parseManualField(text: string): Partial<ExtractedRecord> | null {
   return null;
 }
 
-function parseUnavailableField(text: string): keyof Omit<ExtractedRecord, 'unavailableFields'> | null {
-  const lower = text.toLowerCase();
+function photoToCapturedImage(photo: any): CapturedImage | null {
+  try {
+    let raw: Buffer | null = null;
 
-  if (!(lower.includes('not available') || lower.includes('unknown') || lower.includes('not on package'))) {
+    if (photo?.buffer) {
+      raw = Buffer.isBuffer(photo.buffer) ? photo.buffer : Buffer.from(photo.buffer);
+    } else if (photo?.photoData) {
+      raw = Buffer.isBuffer(photo.photoData) ? photo.photoData : Buffer.from(photo.photoData);
+    }
+
+    if (!raw || raw.length === 0) return null;
+
+    return {
+      base64: raw.toString('base64'),
+      mimeType: photo?.mimeType || 'image/jpeg',
+      capturedAt: new Date().toISOString(),
+    };
+  } catch {
     return null;
   }
-
-  if (lower.includes('vendor') || lower.includes('manufacturer') || lower.includes('brand')) {
-    return 'vendorName';
-  }
-  if (lower.includes('product') || lower.includes('name')) {
-    return 'productName';
-  }
-  if (lower.includes('origin') || lower.includes('country')) {
-    return 'countryOfOrigin';
-  }
-  if (lower.includes('expiry') || lower.includes('expiration') || lower.includes('best by') || lower.includes('bb')) {
-    return 'expirationDate';
-  }
-
-  return null;
 }
 
 class ProductScannerApp extends AppServer {
@@ -208,37 +241,40 @@ class ProductScannerApp extends AppServer {
       userId,
       state: 'idle',
       images: [],
-      merged: emptyRecord(),
+      record: emptyRecord(),
     };
 
     this.sessions.set(sessionId, data);
+    console.log(`Session started for user ${userId}`);
 
-    await this.renderStatus(session, data);
     await session.audio.speak('Scanner ready.');
 
     session.events.onPhotoTaken(async (photo: any) => {
       try {
         if (data.state !== 'collecting') {
+          console.log('Photo ignored because app is not collecting.');
           return;
         }
 
-        const base64 = Buffer.from(photo.photoData).toString('base64');
-        data.images.push({
-          base64,
-          mimeType: photo.mimeType || 'image/jpeg',
-          capturedAt: new Date().toISOString(),
-        });
+        const captured = photoToCapturedImage(photo);
+        if (!captured) {
+          console.error('Photo event had no usable image data.');
+          await session.audio.speak('Photo failed.');
+          return;
+        }
+
+        data.images.push(captured);
 
         console.log('Photo added to current item', {
           count: data.images.length,
-          mimeType: photo.mimeType,
-          bytes: base64.length,
+          mimeType: captured.mimeType,
+          base64Length: captured.base64.length,
         });
 
-        await this.renderStatus(session, data);
+        await session.audio.speak('Captured.');
       } catch (err) {
         console.error('onPhotoTaken failed:', err);
-        await session.layouts.showTextWall('Photo failed', { durationMs: 1500 });
+        await session.audio.speak('Photo failed.');
       }
     });
 
@@ -250,7 +286,6 @@ class ProductScannerApp extends AppServer {
 
       if (text.includes('cancel') || text.includes('stop')) {
         resetItem(data);
-        await this.renderStatus(session, data);
         await session.audio.speak('Cancelled.');
         return;
       }
@@ -259,8 +294,8 @@ class ProductScannerApp extends AppServer {
         if (text.includes('scan') || text.includes('start')) {
           data.state = 'collecting';
           data.images = [];
-          data.merged = emptyRecord();
-          await this.renderStatus(session, data);
+          data.record = emptyRecord();
+          await session.audio.speak('Take photos. Say review when done.');
         } else if (text.includes('list') || text.includes('history')) {
           await this.readList(session, data);
         }
@@ -270,37 +305,39 @@ class ProductScannerApp extends AppServer {
       if (data.state === 'collecting') {
         if (text.includes('review') || text.includes('analyze') || text.includes('process')) {
           await this.reviewCurrentItem(session, data);
+        } else if (text.includes('save')) {
+          await session.audio.speak('Say review first.');
         }
         return;
       }
 
-      if (data.state === 'review') {
+      if (data.state === 'ready') {
         const unavailable = parseUnavailableField(text);
         if (unavailable) {
-          if (!data.merged.unavailableFields.includes(unavailable)) {
-            data.merged.unavailableFields.push(unavailable);
+          if (!data.record.unavailableFields.includes(unavailable)) {
+            data.record.unavailableFields.push(unavailable);
           }
-          await this.renderStatus(session, data);
+          await session.audio.speak(shortMissingMessage(data.record));
           return;
         }
 
         const manual = parseManualField(text);
         if (manual) {
-          data.merged = {
-            ...data.merged,
+          data.record = {
+            ...data.record,
             ...manual,
           };
-          await this.renderStatus(session, data);
+          await session.audio.speak(shortMissingMessage(data.record));
           return;
         }
 
         if (text.includes('another photo') || text.includes('more photo') || text.includes('take more')) {
           data.state = 'collecting';
-          await this.renderStatus(session, data);
+          await session.audio.speak('Take more photos.');
           return;
         }
 
-        if (text.includes('save next') || text.includes('save and next') || text.includes('save and add')) {
+        if (text.includes('save next') || text.includes('save and next') || text.includes('save next item')) {
           await this.saveItem(session, data, true);
           return;
         }
@@ -310,9 +347,13 @@ class ProductScannerApp extends AppServer {
           return;
         }
 
+        if (text.includes('next')) {
+          await this.saveItem(session, data, true);
+          return;
+        }
+
         if (text.includes('close') || text.includes('done')) {
           resetItem(data);
-          await this.renderStatus(session, data);
           await session.audio.speak('Closed.');
           return;
         }
@@ -327,7 +368,6 @@ class ProductScannerApp extends AppServer {
           await this.readList(session, data);
         } else {
           resetItem(data);
-          await this.renderStatus(session, data);
           await session.audio.speak('Cancelled.');
         }
       }
@@ -335,45 +375,7 @@ class ProductScannerApp extends AppServer {
 
     session.events.onDisconnected(() => {
       this.sessions.delete(sessionId);
-    });
-  }
-
-  private async renderStatus(session: any, data: SessionData) {
-    if (data.state === 'idle') {
-      await session.layouts.showReferenceCard({
-        title: 'Product Scanner',
-        text:
-          'Say scan to start\n' +
-          'Use camera button to take photos\n' +
-          'Say review when done\n' +
-          'Long press to cancel',
-      });
-      return;
-    }
-
-    if (data.state === 'collecting') {
-      await session.layouts.showReferenceCard({
-        title: `Photos: ${data.images.length}`,
-        text:
-          'Use camera button for 1+ sides\n' +
-          'Say review when done\n' +
-          'Long press cancels',
-      });
-      return;
-    }
-
-    const missing = missingFields(data.merged);
-    const summary =
-      `Product: ${data.merged.productName || '-'}\n` +
-      `Vendor: ${data.merged.vendorName || '-'}\n` +
-      `Origin: ${data.merged.countryOfOrigin || '-'}\n` +
-      `Expiry: ${data.merged.expirationDate || '-'}\n` +
-      `Missing: ${missing.length ? missing.map(compactFieldLabel).join(', ') : 'None'}\n` +
-      `Say save, save next, another photo, or a field value`;
-
-    await session.layouts.showReferenceCard({
-      title: 'Review Item',
-      text: summary,
+      console.log(`Session disconnected: ${sessionId}`);
     });
   }
 
@@ -383,12 +385,12 @@ class ProductScannerApp extends AppServer {
       return;
     }
 
-    data.state = 'saving';
-    await session.layouts.showTextWall('Analyzing...');
+    data.state = 'reviewing';
+    await session.audio.speak('Reviewing.');
 
     try {
       const prompt = `You are extracting structured product packaging data from multiple photos of the SAME product.
-Merge details across all images into one record.
+Merge details across all photos into one record.
 
 Return ONLY JSON:
 {
@@ -400,12 +402,12 @@ Return ONLY JSON:
 
 Rules:
 - Merge information across all photos.
-- product_name = product/item name
-- vendor_name = seller, vendor, brand, manufacturer, or company if visible
-- country_of_origin = country of origin or made in
-- expiration_date = expiration, expiry, BB, best by, or use by date
-- expiration_date must be YYYY-MM-DD if possible
-- use null when unavailable or unreadable`;
+- product_name = product or item name.
+- vendor_name = vendor, manufacturer, brand, seller, or company if visible.
+- country_of_origin = country of origin or made in.
+- expiration_date = expiration, expiry, BB, best by, or use by date.
+- expiration_date must be YYYY-MM-DD if possible.
+- Use null if unknown.`;
 
       const parts: any[] = data.images.map((img) => ({
         inlineData: {
@@ -426,49 +428,39 @@ Rules:
       console.log('Gemini parsed response:', parsed);
 
       if (parsed) {
-        data.merged.productName = parsed.product_name || data.merged.productName;
-        data.merged.vendorName = parsed.vendor_name || data.merged.vendorName;
-        data.merged.countryOfOrigin = parsed.country_of_origin || data.merged.countryOfOrigin;
-        data.merged.expirationDate = parsed.expiration_date || data.merged.expirationDate;
+        data.record.productName = parsed.product_name || data.record.productName;
+        data.record.vendorName = parsed.vendor_name || data.record.vendorName;
+        data.record.countryOfOrigin = parsed.country_of_origin || data.record.countryOfOrigin;
+        data.record.expirationDate = parsed.expiration_date || data.record.expirationDate;
       }
 
-      data.state = 'review';
-      await this.renderStatus(session, data);
-
-      const missing = missingFields(data.merged);
-      if (!missing.length) {
-        await session.audio.speak('Ready to save.');
-      } else {
-        await session.audio.speak(
-          `Missing ${missing.map(compactFieldLabel).join(', ')}.`
-        );
-      }
+      data.state = 'ready';
+      await session.audio.speak(shortMissingMessage(data.record));
     } catch (err: any) {
       console.error('Review failed:', err);
       data.state = 'collecting';
 
       if (err?.status === 404) {
-        await session.audio.speak('The AI model is unavailable.');
+        await session.audio.speak('AI model unavailable.');
       } else if (err?.status === 429) {
-        await session.audio.speak('The AI quota is exceeded.');
+        await session.audio.speak('AI quota exceeded.');
       } else {
-        await session.audio.speak('Analysis failed.');
+        await session.audio.speak('Review failed.');
       }
-
-      await this.renderStatus(session, data);
     }
   }
 
   private async saveItem(session: any, data: SessionData, startNext: boolean) {
-    if (!data.merged.productName) {
-      await session.audio.speak('Need product name before saving.');
+    if (!data.record.productName) {
+      await session.audio.speak('Need product name first.');
       return;
     }
 
     data.state = 'saving';
-    await session.layouts.showTextWall('Saving...');
 
-    const expiry = data.merged.expirationDate ? calcExpiry(data.merged.expirationDate) : null;
+    const expiry = data.record.expirationDate
+      ? calcExpiry(data.record.expirationDate)
+      : null;
 
     try {
       await db.query(
@@ -487,32 +479,29 @@ Rules:
         VALUES($1, now(), $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
           data.userId,
-          data.merged.productName,
-          data.merged.vendorName,
-          data.merged.countryOfOrigin,
-          data.merged.expirationDate,
+          data.record.productName,
+          data.record.vendorName,
+          data.record.countryOfOrigin,
+          data.record.expirationDate,
           expiry?.isExpired ?? null,
           expiry?.days ?? null,
-          data.merged.unavailableFields.includes('expirationDate'),
+          data.record.unavailableFields.includes('expirationDate'),
           JSON.stringify(data.images),
         ]
       );
 
       if (startNext) {
         data.images = [];
-        data.merged = emptyRecord();
+        data.record = emptyRecord();
         data.state = 'collecting';
-        await this.renderStatus(session, data);
         await session.audio.speak('Saved. Next item.');
       } else {
         resetItem(data);
-        await this.renderStatus(session, data);
         await session.audio.speak('Saved.');
       }
     } catch (err) {
       console.error('Save failed:', err);
-      data.state = 'review';
-      await this.renderStatus(session, data);
+      data.state = 'ready';
       await session.audio.speak('Save failed.');
     }
   }
