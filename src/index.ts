@@ -13,30 +13,50 @@ const db = new Pool({
 const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const model = genai.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-type ScanStep = 'idle' | 'front' | 'barcode' | 'expiry' | 'saving';
+type AppState = 'idle' | 'collecting' | 'review' | 'saving';
 
-type Extraction = {
+type ExtractedRecord = {
   productName: string | null;
-  manufacturer: string | null;
-  barcode: string | null;
-  expiryDate: string | null;
-  noExpiryConfirmed: boolean;
+  vendorName: string | null;
+  countryOfOrigin: string | null;
+  expirationDate: string | null;
+  unavailableFields: string[];
+};
+
+type CapturedImage = {
+  base64: string;
+  mimeType: string;
+  capturedAt: string;
 };
 
 type SessionData = {
   userId: string;
-  step: ScanStep;
-  ext: Extraction;
+  state: AppState;
+  images: CapturedImage[];
+  merged: ExtractedRecord;
 };
 
-function resetExtraction(): Extraction {
+const REQUIRED_FIELDS: Array<keyof Omit<ExtractedRecord, 'unavailableFields'>> = [
+  'productName',
+  'vendorName',
+  'countryOfOrigin',
+  'expirationDate',
+];
+
+function emptyRecord(): ExtractedRecord {
   return {
     productName: null,
-    manufacturer: null,
-    barcode: null,
-    expiryDate: null,
-    noExpiryConfirmed: false,
+    vendorName: null,
+    countryOfOrigin: null,
+    expirationDate: null,
+    unavailableFields: [],
   };
+}
+
+function resetItem(data: SessionData) {
+  data.images = [];
+  data.merged = emptyRecord();
+  data.state = 'idle';
 }
 
 function parseJSON(text: string) {
@@ -56,12 +76,26 @@ function calcExpiry(d: string) {
   return { isExpired: days < 0, days };
 }
 
-function expiryLine(d: string) {
-  const { isExpired, days } = calcExpiry(d);
-  if (isExpired) return `Warning. This product is expired. It expired ${Math.abs(days)} days ago.`;
-  if (days === 0) return `Expiry date ${d}. This expires today.`;
-  if (days <= 7) return `Expiry date ${d}. Caution. Only ${days} days left.`;
-  return `Expiry date ${d}. Good for ${days} more days.`;
+function missingFields(record: ExtractedRecord) {
+  return REQUIRED_FIELDS.filter((field) => {
+    if (record.unavailableFields.includes(field)) return false;
+    return !record[field];
+  });
+}
+
+function compactFieldLabel(field: string) {
+  switch (field) {
+    case 'productName':
+      return 'Product';
+    case 'vendorName':
+      return 'Vendor';
+    case 'countryOfOrigin':
+      return 'Origin';
+    case 'expirationDate':
+      return 'Expiry';
+    default:
+      return field;
+  }
 }
 
 function dateFromSpeech(text: string): string | null {
@@ -100,42 +134,113 @@ function dateFromSpeech(text: string): string | null {
   return null;
 }
 
-function isNoExpiry(text: string) {
-  return (
-    text.includes('no expir') ||
-    text.includes('no date') ||
-    text.includes('no best by') ||
-    text.includes('does not have') ||
-    (text.includes('no') && text.includes('date'))
-  );
+function parseManualField(text: string): Partial<ExtractedRecord> | null {
+  const lower = text.toLowerCase().trim();
+
+  const expiry = dateFromSpeech(lower);
+  if (
+    expiry &&
+    (lower.includes('expiration') ||
+      lower.includes('expiry') ||
+      lower.includes('best by') ||
+      lower.includes('bb') ||
+      lower.includes('use by'))
+  ) {
+    return { expirationDate: expiry };
+  }
+
+  const vendorMatch = lower.match(/(?:vendor|seller|manufacturer|brand)\s+(?:is\s+)?(.+)/);
+  if (vendorMatch) {
+    return { vendorName: vendorMatch[1].trim() };
+  }
+
+  const productMatch = lower.match(/(?:product|name)\s+(?:is\s+)?(.+)/);
+  if (productMatch) {
+    return { productName: productMatch[1].trim() };
+  }
+
+  const originMatch = lower.match(/(?:country of origin|origin|made in)\s+(?:is\s+)?(.+)/);
+  if (originMatch) {
+    return { countryOfOrigin: originMatch[1].trim() };
+  }
+
+  return null;
+}
+
+function parseUnavailableField(text: string): keyof Omit<ExtractedRecord, 'unavailableFields'> | null {
+  const lower = text.toLowerCase();
+
+  if (!(lower.includes('not available') || lower.includes('unknown') || lower.includes('not on package'))) {
+    return null;
+  }
+
+  if (lower.includes('vendor') || lower.includes('manufacturer') || lower.includes('brand')) {
+    return 'vendorName';
+  }
+  if (lower.includes('product') || lower.includes('name')) {
+    return 'productName';
+  }
+  if (lower.includes('origin') || lower.includes('country')) {
+    return 'countryOfOrigin';
+  }
+  if (lower.includes('expiry') || lower.includes('expiration') || lower.includes('best by') || lower.includes('bb')) {
+    return 'expirationDate';
+  }
+
+  return null;
 }
 
 class ProductScannerApp extends AppServer {
   private sessions = new Map<string, SessionData>();
 
-constructor(config: { packageName: string; apiKey: string; port: number }) {
-  super({
-    ...config,
-    subscriptions: {
-      transcription: true,
-      buttonPress: true,
-    },
-  });
-}
+  constructor(config: { packageName: string; apiKey: string; port: number }) {
+    super({
+      ...config,
+      subscriptions: {
+        transcription: true,
+        buttonPress: true,
+      },
+    });
+  }
 
   protected async onSession(session: any, sessionId: string, userId: string) {
     const data: SessionData = {
       userId,
-      step: 'idle',
-      ext: resetExtraction(),
+      state: 'idle',
+      images: [],
+      merged: emptyRecord(),
     };
 
     this.sessions.set(sessionId, data);
-    console.log(`Session started for user ${userId}`);
 
-    await session.audio.speak(
-      'Product scanner ready. Say scan or press the button to start.'
-    );
+    await this.renderStatus(session, data);
+    await session.audio.speak('Scanner ready.');
+
+    session.events.onPhotoTaken(async (photo: any) => {
+      try {
+        if (data.state !== 'collecting') {
+          return;
+        }
+
+        const base64 = Buffer.from(photo.photoData).toString('base64');
+        data.images.push({
+          base64,
+          mimeType: photo.mimeType || 'image/jpeg',
+          capturedAt: new Date().toISOString(),
+        });
+
+        console.log('Photo added to current item', {
+          count: data.images.length,
+          mimeType: photo.mimeType,
+          bytes: base64.length,
+        });
+
+        await this.renderStatus(session, data);
+      } catch (err) {
+        console.error('onPhotoTaken failed:', err);
+        await session.layouts.showTextWall('Photo failed', { durationMs: 1500 });
+      }
+    });
 
     session.events.onTranscription(async (t: any) => {
       if (!t.isFinal) return;
@@ -144,38 +249,73 @@ constructor(config: { packageName: string; apiKey: string; port: number }) {
       console.log('Final transcription:', text);
 
       if (text.includes('cancel') || text.includes('stop')) {
-        await this.cancelFlow(session, data);
+        resetItem(data);
+        await this.renderStatus(session, data);
+        await session.audio.speak('Cancelled.');
         return;
       }
 
-      if (data.step === 'idle') {
+      if (data.state === 'idle') {
         if (text.includes('scan') || text.includes('start')) {
-          await this.beginFlow(session, data);
+          data.state = 'collecting';
+          data.images = [];
+          data.merged = emptyRecord();
+          await this.renderStatus(session, data);
         } else if (text.includes('list') || text.includes('history')) {
           await this.readList(session, data);
         }
         return;
       }
 
-      if (data.step === 'expiry') {
-        if (isNoExpiry(text)) {
-          data.ext.noExpiryConfirmed = true;
-          await session.audio.speak('No expiration date noted. Saving now.');
-          await this.saveItem(session, data);
-          return;
+      if (data.state === 'collecting') {
+        if (text.includes('review') || text.includes('analyze') || text.includes('process')) {
+          await this.reviewCurrentItem(session, data);
         }
-
-        const spokenDate = dateFromSpeech(text);
-        if (spokenDate) {
-          data.ext.expiryDate = spokenDate;
-          await session.audio.speak(`${expiryLine(spokenDate)} Saving now.`);
-          await this.saveItem(session, data);
-          return;
-        }
+        return;
       }
 
-      if (text.includes('save')) {
-        await this.saveItem(session, data);
+      if (data.state === 'review') {
+        const unavailable = parseUnavailableField(text);
+        if (unavailable) {
+          if (!data.merged.unavailableFields.includes(unavailable)) {
+            data.merged.unavailableFields.push(unavailable);
+          }
+          await this.renderStatus(session, data);
+          return;
+        }
+
+        const manual = parseManualField(text);
+        if (manual) {
+          data.merged = {
+            ...data.merged,
+            ...manual,
+          };
+          await this.renderStatus(session, data);
+          return;
+        }
+
+        if (text.includes('another photo') || text.includes('more photo') || text.includes('take more')) {
+          data.state = 'collecting';
+          await this.renderStatus(session, data);
+          return;
+        }
+
+        if (text.includes('save next') || text.includes('save and next') || text.includes('save and add')) {
+          await this.saveItem(session, data, true);
+          return;
+        }
+
+        if (text === 'save' || text.includes('save as is')) {
+          await this.saveItem(session, data, false);
+          return;
+        }
+
+        if (text.includes('close') || text.includes('done')) {
+          resetItem(data);
+          await this.renderStatus(session, data);
+          await session.audio.speak('Closed.');
+          return;
+        }
       }
     });
 
@@ -183,384 +323,228 @@ constructor(config: { packageName: string; apiKey: string; port: number }) {
       console.log('Button press:', btn?.pressType);
 
       if (btn?.pressType === 'long') {
-        if (data.step === 'idle') {
+        if (data.state === 'idle') {
           await this.readList(session, data);
         } else {
-          await this.cancelFlow(session, data);
+          resetItem(data);
+          await this.renderStatus(session, data);
+          await session.audio.speak('Cancelled.');
         }
-        return;
-      }
-
-      if (btn?.pressType !== 'short') return;
-
-      if (data.step === 'idle') {
-        await this.beginFlow(session, data);
-        return;
-      }
-
-      if (data.step === 'front') {
-        await this.captureFrontLabel(session, data);
-        return;
-      }
-
-      if (data.step === 'barcode') {
-        await this.captureBarcode(session, data);
-        return;
-      }
-
-      if (data.step === 'expiry') {
-        await this.captureExpiry(session, data);
       }
     });
 
     session.events.onDisconnected(() => {
       this.sessions.delete(sessionId);
-      console.log(`Session disconnected: ${sessionId}`);
     });
   }
 
-  private async beginFlow(session: any, data: SessionData) {
-    data.ext = resetExtraction();
-    data.step = 'front';
-
-    await session.audio.speak(
-      'Starting scan. Hold the front label still in view, then press the button to capture the product image.'
-    );
-  }
-
-  private async cancelFlow(session: any, data: SessionData) {
-    data.step = 'idle';
-    data.ext = resetExtraction();
-    await session.audio.speak('Scan cancelled.');
-  }
-
-  private async takePhoto(session: any, label: string) {
-    console.log(`Capturing photo for step: ${label}`);
-
-    const photo = await session.camera.requestPhoto({
-      compress: 'medium',
-      size: 'large',
-    });
-
-    const bytes =
-      photo?.buffer && typeof photo.buffer.length === 'number'
-        ? photo.buffer.length
-        : 0;
-
-    console.log('Photo captured', {
-      step: label,
-      bytes,
-      hasBuffer: !!photo?.buffer,
-      mimeType: photo?.mimeType || 'image/jpeg',
-    });
-
-    if (!photo?.buffer || bytes === 0) {
-      throw new Error(`No image buffer returned for step: ${label}`);
-    }
-
-    return {
-      base64: photo.buffer.toString('base64'),
-      mimeType: photo?.mimeType || 'image/jpeg',
-      bytes,
-    };
-  }
-
-  private async runGemini(
-    prompt: string,
-    base64: string,
-    mimeType: string,
-    label: string
-  ) {
-    console.log(`Sending image to Gemini for step: ${label}`);
-    console.log(`Base64 length for ${label}:`, base64.length);
-
-    const resp = await model.generateContent([
-      {
-        inlineData: {
-          mimeType,
-          data: base64,
-        },
-      },
-      prompt,
-    ]);
-
-    const text = resp.response.text();
-    console.log(`Gemini raw response for ${label}:`, text);
-
-    const parsed = parseJSON(text);
-    console.log(`Gemini parsed response for ${label}:`, parsed);
-
-    return { text, parsed };
-  }
-
-  private async captureFrontLabel(session: any, data: SessionData) {
-    try {
-      await session.audio.speak('Capturing product image now.');
-
-      const photo = await this.takePhoto(session, 'front');
-
-      const prompt = `Analyze this product package front label.
-Extract ONLY clearly visible info.
-Reply ONLY with JSON:
-{"product_name":null,"manufacturer":null}
-Rules:
-- product_name should be the main product name
-- manufacturer should be the brand or maker
-- use null if unclear`;
-
-      const { parsed, text } = await this.runGemini(
-        prompt,
-        photo.base64,
-        photo.mimeType,
-        'front'
-      );
-
-      if (!parsed || !parsed.product_name) {
-        await session.audio.speak(
-          'I captured the image, but I could not identify the product yet. Please hold the front label closer and steadier, then press the button again.'
-        );
-        return;
-      }
-
-      data.ext.productName = parsed.product_name;
-      data.ext.manufacturer = parsed.manufacturer || null;
-      data.step = 'barcode';
-
-      const spokenResult = parsed.manufacturer
-        ? `I found ${parsed.product_name} by ${parsed.manufacturer}.`
-        : `I found ${parsed.product_name}.`;
-
-      console.log('Front capture succeeded:', {
-        productName: data.ext.productName,
-        manufacturer: data.ext.manufacturer,
-        geminiText: text,
+  private async renderStatus(session: any, data: SessionData) {
+    if (data.state === 'idle') {
+      await session.layouts.showReferenceCard({
+        title: 'Product Scanner',
+        text:
+          'Say scan to start\n' +
+          'Use camera button to take photos\n' +
+          'Say review when done\n' +
+          'Long press to cancel',
       });
-
-      await session.audio.speak(
-        `${spokenResult} Now show the barcode and press the button.`
-      );
-    } catch (err) {
-      console.error('Front label capture failed:', err);
-      await session.audio.speak(
-        'I had trouble reading that image. Please try again.'
-      );
-    }
-  }
-
-  private async captureBarcode(session: any, data: SessionData) {
-    try {
-      await session.audio.speak('Capturing barcode image now.');
-
-      const photo = await this.takePhoto(session, 'barcode');
-
-      const prompt = `Analyze this image for a product barcode or QR code.
-Extract ONLY clearly visible info.
-Reply ONLY with JSON:
-{"barcode":null}
-Rules:
-- barcode should be the decoded numeric or alphanumeric value if visible
-- use null if not readable`;
-
-      const { parsed, text } = await this.runGemini(
-        prompt,
-        photo.base64,
-        photo.mimeType,
-        'barcode'
-      );
-
-      if (!parsed || !parsed.barcode) {
-        await session.audio.speak(
-          'I captured the image, but I could not read the barcode. Please center the barcode, hold it still, and press the button again.'
-        );
-        return;
-      }
-
-      data.ext.barcode = parsed.barcode;
-      data.step = 'expiry';
-
-      console.log('Barcode capture succeeded:', {
-        barcode: data.ext.barcode,
-        geminiText: text,
-      });
-
-      await session.audio.speak(
-        `I found barcode ${parsed.barcode}. Now show the expiration date and press the button. Or say no expiration date.`
-      );
-    } catch (err) {
-      console.error('Barcode capture failed:', err);
-      await session.audio.speak(
-        'I had trouble reading that barcode image. Please try again.'
-      );
-    }
-  }
-
-  private async captureExpiry(session: any, data: SessionData) {
-    try {
-      await session.audio.speak('Capturing expiration date image now.');
-
-      const photo = await this.takePhoto(session, 'expiry');
-
-      const prompt = `Analyze this image for an expiration date, best by date, or use by date.
-Extract ONLY clearly visible info.
-Reply ONLY with JSON:
-{"expiry_date":null}
-Rules:
-- expiry_date must be YYYY-MM-DD
-- use null if not readable`;
-
-      const { parsed, text } = await this.runGemini(
-        prompt,
-        photo.base64,
-        photo.mimeType,
-        'expiry'
-      );
-
-      if (!parsed || !parsed.expiry_date) {
-        await session.audio.speak(
-          'I captured the image, but I could not read an expiration date. Please hold the date closer and steadier, press the button again, or say no expiration date.'
-        );
-        return;
-      }
-
-      data.ext.expiryDate = parsed.expiry_date;
-
-      console.log('Expiry capture succeeded:', {
-        expiryDate: data.ext.expiryDate,
-        geminiText: text,
-      });
-
-      await session.audio.speak(`${expiryLine(parsed.expiry_date)} Saving now.`);
-      await this.saveItem(session, data);
-    } catch (err) {
-      console.error('Expiry capture failed:', err);
-      await session.audio.speak(
-        'I had trouble reading that date image. Please try again.'
-      );
-    }
-  }
-
-  private async saveItem(session: any, data: SessionData) {
-    if (!data.ext.productName) {
-      await session.audio.speak(
-        'I do not have a product name yet, so I cannot save this item.'
-      );
       return;
     }
 
-    data.step = 'saving';
+    if (data.state === 'collecting') {
+      await session.layouts.showReferenceCard({
+        title: `Photos: ${data.images.length}`,
+        text:
+          'Use camera button for 1+ sides\n' +
+          'Say review when done\n' +
+          'Long press cancels',
+      });
+      return;
+    }
 
-    const ext = data.ext;
-    const expiry = ext.expiryDate ? calcExpiry(ext.expiryDate) : null;
+    const missing = missingFields(data.merged);
+    const summary =
+      `Product: ${data.merged.productName || '-'}\n` +
+      `Vendor: ${data.merged.vendorName || '-'}\n` +
+      `Origin: ${data.merged.countryOfOrigin || '-'}\n` +
+      `Expiry: ${data.merged.expirationDate || '-'}\n` +
+      `Missing: ${missing.length ? missing.map(compactFieldLabel).join(', ') : 'None'}\n` +
+      `Say save, save next, another photo, or a field value`;
 
-    console.log('Saving item to database:', {
-      userId: data.userId,
-      productName: ext.productName,
-      manufacturer: ext.manufacturer,
-      barcode: ext.barcode,
-      expiryDate: ext.expiryDate,
-      noExpiryConfirmed: ext.noExpiryConfirmed,
-      isExpired: expiry?.isExpired ?? null,
-      daysUntilExpiry: expiry?.days ?? null,
+    await session.layouts.showReferenceCard({
+      title: 'Review Item',
+      text: summary,
     });
+  }
+
+  private async reviewCurrentItem(session: any, data: SessionData) {
+    if (!data.images.length) {
+      await session.audio.speak('No photos yet.');
+      return;
+    }
+
+    data.state = 'saving';
+    await session.layouts.showTextWall('Analyzing...');
+
+    try {
+      const prompt = `You are extracting structured product packaging data from multiple photos of the SAME product.
+Merge details across all images into one record.
+
+Return ONLY JSON:
+{
+  "product_name": null,
+  "vendor_name": null,
+  "country_of_origin": null,
+  "expiration_date": null
+}
+
+Rules:
+- Merge information across all photos.
+- product_name = product/item name
+- vendor_name = seller, vendor, brand, manufacturer, or company if visible
+- country_of_origin = country of origin or made in
+- expiration_date = expiration, expiry, BB, best by, or use by date
+- expiration_date must be YYYY-MM-DD if possible
+- use null when unavailable or unreadable`;
+
+      const parts: any[] = data.images.map((img) => ({
+        inlineData: {
+          mimeType: img.mimeType,
+          data: img.base64,
+        },
+      }));
+
+      parts.push(prompt);
+
+      console.log('Sending photos to Gemini', { photoCount: data.images.length });
+
+      const resp = await model.generateContent(parts);
+      const text = resp.response.text();
+      const parsed = parseJSON(text);
+
+      console.log('Gemini raw response:', text);
+      console.log('Gemini parsed response:', parsed);
+
+      if (parsed) {
+        data.merged.productName = parsed.product_name || data.merged.productName;
+        data.merged.vendorName = parsed.vendor_name || data.merged.vendorName;
+        data.merged.countryOfOrigin = parsed.country_of_origin || data.merged.countryOfOrigin;
+        data.merged.expirationDate = parsed.expiration_date || data.merged.expirationDate;
+      }
+
+      data.state = 'review';
+      await this.renderStatus(session, data);
+
+      const missing = missingFields(data.merged);
+      if (!missing.length) {
+        await session.audio.speak('Ready to save.');
+      } else {
+        await session.audio.speak(
+          `Missing ${missing.map(compactFieldLabel).join(', ')}.`
+        );
+      }
+    } catch (err: any) {
+      console.error('Review failed:', err);
+      data.state = 'collecting';
+
+      if (err?.status === 404) {
+        await session.audio.speak('The AI model is unavailable.');
+      } else if (err?.status === 429) {
+        await session.audio.speak('The AI quota is exceeded.');
+      } else {
+        await session.audio.speak('Analysis failed.');
+      }
+
+      await this.renderStatus(session, data);
+    }
+  }
+
+  private async saveItem(session: any, data: SessionData, startNext: boolean) {
+    if (!data.merged.productName) {
+      await session.audio.speak('Need product name before saving.');
+      return;
+    }
+
+    data.state = 'saving';
+    await session.layouts.showTextWall('Saving...');
+
+    const expiry = data.merged.expirationDate ? calcExpiry(data.merged.expirationDate) : null;
 
     try {
       await db.query(
         `INSERT INTO scanned_items(
-          user_id, scanned_at, product_name, manufacturer, barcode,
-          expiry_date, is_expired, days_until_expiry,
-          no_expiry_confirmed, stream_hls_url
+          user_id,
+          scanned_at,
+          product_name,
+          vendor_name,
+          country_of_origin,
+          expiry_date,
+          is_expired,
+          days_until_expiry,
+          no_expiry_confirmed,
+          captured_images_json
         )
         VALUES($1, now(), $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
           data.userId,
-          ext.productName,
-          ext.manufacturer || 'Unknown',
-          ext.barcode,
-          ext.expiryDate,
+          data.merged.productName,
+          data.merged.vendorName,
+          data.merged.countryOfOrigin,
+          data.merged.expirationDate,
           expiry?.isExpired ?? null,
           expiry?.days ?? null,
-          ext.noExpiryConfirmed,
-          null,
+          data.merged.unavailableFields.includes('expirationDate'),
+          JSON.stringify(data.images),
         ]
       );
 
-      let tts = `Saved: ${ext.productName}`;
-
-      if (ext.manufacturer && ext.manufacturer !== 'Unknown') {
-        tts += ` by ${ext.manufacturer}`;
-      }
-
-      if (ext.barcode) {
-        tts += '. Barcode recorded';
-      }
-
-      if (ext.noExpiryConfirmed) {
-        tts += '. No expiration date.';
-      } else if (expiry?.isExpired) {
-        tts += `. Expired ${Math.abs(expiry.days)} days ago. Please discard.`;
-      } else if (expiry && expiry.days <= 7) {
-        tts += `. Caution, expires in ${expiry.days} days.`;
-      } else if (ext.expiryDate && expiry) {
-        tts += `. Good for ${expiry.days} more days.`;
+      if (startNext) {
+        data.images = [];
+        data.merged = emptyRecord();
+        data.state = 'collecting';
+        await this.renderStatus(session, data);
+        await session.audio.speak('Saved. Next item.');
       } else {
-        tts += '. No expiration date found.';
+        resetItem(data);
+        await this.renderStatus(session, data);
+        await session.audio.speak('Saved.');
       }
-
-      data.step = 'idle';
-      data.ext = resetExtraction();
-
-      await session.audio.speak(tts);
     } catch (err) {
-      console.error('Database save failed:', err);
-      data.step = 'idle';
-      await session.audio.speak(
-        'I had trouble saving that item to the database.'
-      );
+      console.error('Save failed:', err);
+      data.state = 'review';
+      await this.renderStatus(session, data);
+      await session.audio.speak('Save failed.');
     }
   }
 
   private async readList(session: any, data: SessionData) {
     try {
       const { rows } = await db.query(
-        `SELECT product_name, is_expired, days_until_expiry, no_expiry_confirmed
+        `SELECT product_name, vendor_name, days_until_expiry, is_expired
          FROM scanned_items
          WHERE user_id = $1
          ORDER BY scanned_at DESC
-         LIMIT 20`,
+         LIMIT 5`,
         [data.userId]
       );
 
       if (!rows.length) {
-        await session.audio.speak('No items scanned yet.');
+        await session.audio.speak('No items yet.');
         return;
       }
 
-      const expired = rows.filter((r: any) => r.is_expired).length;
-      const soon = rows.filter(
-        (r: any) =>
-          !r.is_expired &&
-          r.days_until_expiry != null &&
-          r.days_until_expiry <= 7
-      ).length;
-
       const preview = rows
-        .slice(0, 3)
         .map((r: any) => {
-          if (r.no_expiry_confirmed) return `${r.product_name}, no expiry`;
           if (r.is_expired) return `${r.product_name}, expired`;
-          if (r.days_until_expiry != null) {
-            return `${r.product_name}, ${r.days_until_expiry} days`;
-          }
-          return `${r.product_name}, no date`;
+          if (r.days_until_expiry != null) return `${r.product_name}, ${r.days_until_expiry} days`;
+          return `${r.product_name}`;
         })
         .join('. ');
 
-      await session.audio.speak(
-        `${rows.length} items. ${expired} expired, ${soon} expiring soon. ${preview}`
-      );
+      await session.audio.speak(preview);
     } catch (err) {
       console.error('Read list failed:', err);
-      await session.audio.speak('I had trouble loading scanned items.');
+      await session.audio.speak('Could not load items.');
     }
   }
 
