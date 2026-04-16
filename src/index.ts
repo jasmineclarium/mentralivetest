@@ -209,7 +209,9 @@ function photoToCapturedImage(photo: any): CapturedImage | null {
     if (photo?.buffer) {
       raw = Buffer.isBuffer(photo.buffer) ? photo.buffer : Buffer.from(photo.buffer);
     } else if (photo?.photoData) {
-      raw = Buffer.isBuffer(photo.photoData) ? photo.photoData : Buffer.from(photo.photoData);
+      raw = Buffer.isBuffer(photo.photoData)
+        ? photo.photoData
+        : Buffer.from(photo.photoData);
     } else if (photo?.data) {
       raw = Buffer.isBuffer(photo.data) ? photo.data : Buffer.from(photo.data);
     } else if (photo?.base64) {
@@ -258,105 +260,47 @@ class ProductScannerApp extends AppServer {
     this.sessions.set(sessionId, data);
     console.log(`Session started for user ${userId}`);
 
+    // Critical: explicitly subscribe so events actually reach the app.
+    try {
+      await session.updateSubscriptions([
+        {
+          type: 'TRANSCRIPTION',
+          config: {
+            languages: ['en-US'],
+            interimResults: false,
+          },
+        },
+        {
+          type: 'BUTTON_PRESS',
+          config: {
+            buttons: ['MAIN'],
+          },
+        },
+      ]);
+
+      console.log('Subscriptions updated successfully');
+    } catch (err) {
+      console.error('updateSubscriptions failed:', err);
+    }
+
     await session.audio.speak(
-      'Welcome to Clarium Vision. Please use the right side button to capture images of products when you are ready.'
+      'Welcome to Clarium Vision. Say capture when you are ready to scan a product.'
     );
 
-    session.events.onPhotoTaken(async (photo: any) => {
-      console.log('onPhotoTaken fired', {
-        sessionId,
-        state: data.state,
-        hasPhotoData: !!photo?.photoData,
-        hasBuffer: !!photo?.buffer,
-        hasData: !!photo?.data,
-        hasBase64: !!photo?.base64,
-        mimeType: photo?.mimeType,
-        keys: Object.keys(photo || {}),
-      });
-
-      // Backup handler only. Main path is short-press -> requestPhoto -> handleCapturedPhoto.
-      // This prevents duplicate processing if the SDK also emits onPhotoTaken for the same capture.
-    });
-
     session.events.onTranscription(async (t: any) => {
-      if (!t.isFinal) return;
+      if (!t?.isFinal) return;
 
       const text = (t.text || '').toLowerCase().trim();
       console.log('Final transcription:', text);
 
-      if (text.includes('cancel') || text.includes('stop')) {
-        resetItem(data);
-        await session.audio.speak('Cancelled.');
-        return;
-      }
-
-      if (text.includes('list') || text.includes('history')) {
-        await this.readList(session, data);
-        return;
-      }
-
-      if (data.state === 'ready') {
-        const unavailable = parseUnavailableField(text);
-        if (unavailable) {
-          if (!data.record.unavailableFields.includes(unavailable)) {
-            data.record.unavailableFields.push(unavailable);
-          }
-          const stillMissing = missingFields(data.record);
-          if (!stillMissing.length && data.record.productName) {
-            await this.saveItem(session, data, false);
-          } else {
-            await session.audio.speak(shortMissingMessage(data.record));
-          }
-          return;
-        }
-
-        const manual = parseManualField(text);
-        if (manual) {
-          data.record = { ...data.record, ...manual };
-          if (data.record.productName) {
-            await this.saveItem(session, data, false);
-          } else {
-            await session.audio.speak(shortMissingMessage(data.record));
-          }
-          return;
-        }
-
-        if (text === 'save' || text.includes('save as is')) {
-          if (data.record.productName) {
-            await this.saveItem(session, data, false);
-          } else {
-            await session.audio.speak('Need at least a product name.');
-          }
-          return;
-        }
-
-        if (text.includes('retake') || text.includes('another photo') || text.includes('more photo')) {
-          data.state = 'idle';
-          data.images = [];
-          data.record = emptyRecord();
-          await session.audio.speak('Ready. Press the right side button to capture again.');
-          return;
-        }
-
-        if (text.includes('close') || text.includes('done')) {
-          resetItem(data);
-          await session.audio.speak('Closed.');
-          return;
-        }
-      }
-    });
-
-    session.events.onButtonPress(async (btn: any) => {
-      console.log('Button press:', btn?.pressType, btn);
-
-      const buttonId = String(btn?.buttonId || btn?.button || '').toLowerCase();
-      const isShortPress = btn?.pressType === 'short';
-      const isRightSideButton =
-        buttonId.includes('right') ||
-        buttonId.includes('main') ||
-        buttonId === '';
-
-      if (isShortPress && isRightSideButton) {
+      // Voice trigger for capture
+      if (
+        text === 'capture' ||
+        text === 'scan' ||
+        text.includes('capture image') ||
+        text.includes('take picture') ||
+        text.includes('scan product')
+      ) {
         if (data.state === 'reviewing' || data.state === 'saving') {
           await session.audio.speak('Still processing, please wait.');
           return;
@@ -365,10 +309,12 @@ class ProductScannerApp extends AppServer {
         try {
           resetItem(data);
 
+          await session.audio.speak('Capturing image.');
+
           const photo = await session.camera.requestPhoto({
             metadata: {
               reason: 'product-scan',
-              source: 'short-press-right-button',
+              source: 'voice-command',
             },
           });
 
@@ -391,14 +337,85 @@ class ProductScannerApp extends AppServer {
         return;
       }
 
-      if (btn?.pressType === 'long') {
-        if (data.state === 'idle' || data.state === 'ready') {
-          await this.readList(session, data);
-        } else {
+      if (text.includes('cancel') || text.includes('stop')) {
+        resetItem(data);
+        await session.audio.speak('Cancelled.');
+        return;
+      }
+
+      if (text.includes('list') || text.includes('history')) {
+        await this.readList(session, data);
+        return;
+      }
+
+      if (data.state === 'ready') {
+        const unavailable = parseUnavailableField(text);
+        if (unavailable) {
+          if (!data.record.unavailableFields.includes(unavailable)) {
+            data.record.unavailableFields.push(unavailable);
+          }
+
+          const stillMissing = missingFields(data.record);
+          if (!stillMissing.length && data.record.productName) {
+            await this.saveItem(session, data, false);
+          } else {
+            await session.audio.speak(shortMissingMessage(data.record));
+          }
+          return;
+        }
+
+        const manual = parseManualField(text);
+        if (manual) {
+          data.record = { ...data.record, ...manual };
+
+          if (data.record.productName) {
+            await this.saveItem(session, data, false);
+          } else {
+            await session.audio.speak(shortMissingMessage(data.record));
+          }
+          return;
+        }
+
+        if (text === 'save' || text.includes('save as is')) {
+          if (data.record.productName) {
+            await this.saveItem(session, data, false);
+          } else {
+            await session.audio.speak('Need at least a product name.');
+          }
+          return;
+        }
+
+        if (text.includes('retake') || text.includes('another photo') || text.includes('more photo')) {
+          data.state = 'idle';
+          data.images = [];
+          data.record = emptyRecord();
+          await session.audio.speak('Ready. Say capture when you are ready.');
+          return;
+        }
+
+        if (text.includes('close') || text.includes('done')) {
           resetItem(data);
-          await session.audio.speak('Cancelled.');
+          await session.audio.speak('Closed.');
+          return;
         }
       }
+    });
+
+    // Keep button logging for debugging, but voice is the primary trigger now.
+    session.events.onButtonPress(async (btn: any) => {
+      console.log('Button press:', btn?.pressType, btn);
+    });
+
+    // Optional passive logging so you can see whether Mentra emits photo events too.
+    session.events.onPhotoTaken(async (photo: any) => {
+      console.log('onPhotoTaken fired', {
+        hasPhotoData: !!photo?.photoData,
+        hasBuffer: !!photo?.buffer,
+        hasData: !!photo?.data,
+        hasBase64: !!photo?.base64,
+        mimeType: photo?.mimeType,
+        keys: Object.keys(photo || {}),
+      });
     });
 
     session.events.onDisconnected(() => {
@@ -449,6 +466,8 @@ class ProductScannerApp extends AppServer {
         base64Length: captured.base64.length,
       });
 
+      await session.audio.speak('Image captured. Processing.');
+
       const reviewed = await this.reviewCurrentItem(data);
 
       console.log('Review result', {
@@ -463,6 +482,9 @@ class ProductScannerApp extends AppServer {
         await session.audio.speak(
           `Could not save automatically. ${shortMissingMessage(data.record)} Say corrections or retake.`
         );
+      } else {
+        data.state = 'idle';
+        await session.audio.speak('Review failed.');
       }
     } catch (err) {
       console.error('Auto pipeline failed:', err);
