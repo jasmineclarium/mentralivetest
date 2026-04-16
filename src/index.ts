@@ -247,15 +247,17 @@ class ProductScannerApp extends AppServer {
     this.sessions.set(sessionId, data);
     console.log(`Session started for user ${userId}`);
 
-    await session.audio.speak('Scanner ready.');
+    await session.audio.speak('Scanner ready. Press button to scan.');
 
+    // ─── AUTO PIPELINE: capture → review → save ───────────────────────────────
     session.events.onPhotoTaken(async (photo: any) => {
-      try {
-        if (data.state !== 'collecting') {
-          console.log('Photo ignored because app is not collecting.');
-          return;
-        }
+      // Prevent concurrent reviews/saves
+      if (data.state === 'reviewing' || data.state === 'saving') {
+        await session.audio.speak('Still processing, please wait.');
+        return;
+      }
 
+      try {
         const captured = photoToCapturedImage(photo);
         if (!captured) {
           console.error('Photo event had no usable image data.');
@@ -263,20 +265,36 @@ class ProductScannerApp extends AppServer {
           return;
         }
 
+        // Always accept photos regardless of current state
         data.images.push(captured);
+        data.state = 'collecting';
 
-        console.log('Photo added to current item', {
+        console.log('Photo captured, starting auto-review', {
           count: data.images.length,
           mimeType: captured.mimeType,
           base64Length: captured.base64.length,
         });
 
-        await session.audio.speak('Captured.');
+        await session.audio.speak('Captured. Analyzing...');
+
+        // Auto-review with Gemini
+        const reviewed = await this.reviewCurrentItem(session, data);
+
+        // Auto-save if we have at least a product name
+        if (reviewed && data.record.productName) {
+          await this.saveItem(session, data, false);
+        } else if (reviewed) {
+          // Reviewed but missing product name — prompt user
+          await session.audio.speak(`Could not save. ${shortMissingMessage(data.record)} Say corrections or retake.`);
+          data.state = 'ready';
+        }
       } catch (err) {
-        console.error('onPhotoTaken failed:', err);
-        await session.audio.speak('Photo failed.');
+        console.error('Auto pipeline failed:', err);
+        await session.audio.speak('Processing failed.');
+        data.state = 'idle';
       }
     });
+    // ─────────────────────────────────────────────────────────────────────────
 
     session.events.onTranscription(async (t: any) => {
       if (!t.isFinal) return;
@@ -290,65 +308,53 @@ class ProductScannerApp extends AppServer {
         return;
       }
 
-      if (data.state === 'idle') {
-        if (text.includes('scan') || text.includes('start')) {
-          data.state = 'collecting';
-          data.images = [];
-          data.record = emptyRecord();
-          await session.audio.speak('Take photos. Say review when done.');
-        } else if (text.includes('list') || text.includes('history')) {
-          await this.readList(session, data);
-        }
+      if (text.includes('list') || text.includes('history')) {
+        await this.readList(session, data);
         return;
       }
 
-      if (data.state === 'collecting') {
-        if (text.includes('review') || text.includes('analyze') || text.includes('process')) {
-          await this.reviewCurrentItem(session, data);
-        } else if (text.includes('save')) {
-          await session.audio.speak('Say review first.');
-        }
-        return;
-      }
-
+      // Manual corrections when in ready state (after a failed auto-save)
       if (data.state === 'ready') {
         const unavailable = parseUnavailableField(text);
         if (unavailable) {
           if (!data.record.unavailableFields.includes(unavailable)) {
             data.record.unavailableFields.push(unavailable);
           }
-          await session.audio.speak(shortMissingMessage(data.record));
+          const stillMissing = missingFields(data.record);
+          if (!stillMissing.length) {
+            await this.saveItem(session, data, false);
+          } else {
+            await session.audio.speak(shortMissingMessage(data.record));
+          }
           return;
         }
 
         const manual = parseManualField(text);
         if (manual) {
-          data.record = {
-            ...data.record,
-            ...manual,
-          };
-          await session.audio.speak(shortMissingMessage(data.record));
-          return;
-        }
-
-        if (text.includes('another photo') || text.includes('more photo') || text.includes('take more')) {
-          data.state = 'collecting';
-          await session.audio.speak('Take more photos.');
-          return;
-        }
-
-        if (text.includes('save next') || text.includes('save and next') || text.includes('save next item')) {
-          await this.saveItem(session, data, true);
+          data.record = { ...data.record, ...manual };
+          // Auto-save once product name is filled in
+          if (data.record.productName) {
+            await this.saveItem(session, data, false);
+          } else {
+            await session.audio.speak(shortMissingMessage(data.record));
+          }
           return;
         }
 
         if (text === 'save' || text.includes('save as is')) {
-          await this.saveItem(session, data, false);
+          if (data.record.productName) {
+            await this.saveItem(session, data, false);
+          } else {
+            await session.audio.speak('Need at least a product name.');
+          }
           return;
         }
 
-        if (text.includes('next')) {
-          await this.saveItem(session, data, true);
+        if (text.includes('retake') || text.includes('another photo') || text.includes('more photo')) {
+          data.state = 'idle';
+          data.images = [];
+          data.record = emptyRecord();
+          await session.audio.speak('Ready. Press button to retake.');
           return;
         }
 
@@ -363,14 +369,16 @@ class ProductScannerApp extends AppServer {
     session.events.onButtonPress(async (btn: any) => {
       console.log('Button press:', btn?.pressType);
 
+      // Long press = read history or cancel current
       if (btn?.pressType === 'long') {
-        if (data.state === 'idle') {
+        if (data.state === 'idle' || data.state === 'ready') {
           await this.readList(session, data);
         } else {
           resetItem(data);
           await session.audio.speak('Cancelled.');
         }
       }
+      // Short press is handled natively by SDK → fires onPhotoTaken automatically
     });
 
     session.events.onDisconnected(() => {
@@ -379,14 +387,14 @@ class ProductScannerApp extends AppServer {
     });
   }
 
-  private async reviewCurrentItem(session: any, data: SessionData) {
+  // Returns true if review succeeded (even if fields are missing)
+  private async reviewCurrentItem(session: any, data: SessionData): Promise<boolean> {
     if (!data.images.length) {
       await session.audio.speak('No photos yet.');
-      return;
+      return false;
     }
 
     data.state = 'reviewing';
-    await session.audio.speak('Reviewing.');
 
     try {
       const prompt = `You are extracting structured product packaging data from multiple photos of the SAME product.
@@ -435,10 +443,10 @@ Rules:
       }
 
       data.state = 'ready';
-      await session.audio.speak(shortMissingMessage(data.record));
+      return true;
     } catch (err: any) {
       console.error('Review failed:', err);
-      data.state = 'collecting';
+      data.state = 'idle';
 
       if (err?.status === 404) {
         await session.audio.speak('AI model unavailable.');
@@ -447,6 +455,7 @@ Rules:
       } else {
         await session.audio.speak('Review failed.');
       }
+      return false;
     }
   }
 
@@ -493,8 +502,8 @@ Rules:
       if (startNext) {
         data.images = [];
         data.record = emptyRecord();
-        data.state = 'collecting';
-        await session.audio.speak('Saved. Next item.');
+        data.state = 'idle';
+        await session.audio.speak('Saved. Ready for next.');
       } else {
         resetItem(data);
         await session.audio.speak('Saved.');
