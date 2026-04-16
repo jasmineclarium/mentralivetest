@@ -6,19 +6,6 @@ const { AppServer } = MentraSDK as any;
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
-if (!process.env.DATABASE_URL) {
-  console.error('Missing DATABASE_URL');
-}
-if (!process.env.GEMINI_API_KEY) {
-  console.error('Missing GEMINI_API_KEY');
-}
-if (!process.env.MENTRA_PACKAGE_NAME) {
-  console.error('Missing MENTRA_PACKAGE_NAME');
-}
-if (!process.env.MENTRA_API_KEY) {
-  console.error('Missing MENTRA_API_KEY');
-}
-
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
@@ -269,13 +256,11 @@ class ProductScannerApp extends AppServer {
     };
 
     this.sessions.set(sessionId, data);
-    console.log(`Session started for user ${userId} (${sessionId})`);
+    console.log(`Session started for user ${userId}`);
 
-    try {
-      await session.audio.speak('Scanner ready. Press button to scan.');
-    } catch (err) {
-      console.error('Initial speak failed:', err);
-    }
+    await session.audio.speak(
+      'Welcome to Clarium Vision. Please use the right side button to capture images of products when you are ready.'
+    );
 
     session.events.onPhotoTaken(async (photo: any) => {
       console.log('onPhotoTaken fired', {
@@ -289,56 +274,8 @@ class ProductScannerApp extends AppServer {
         keys: Object.keys(photo || {}),
       });
 
-      if (data.state === 'reviewing' || data.state === 'saving') {
-        await session.audio.speak('Still processing, please wait.');
-        return;
-      }
-
-      try {
-        const captured = photoToCapturedImage(photo);
-
-        if (!captured) {
-          console.error('Photo event had no usable image data.', {
-            hasPhotoData: !!photo?.photoData,
-            hasBuffer: !!photo?.buffer,
-            hasData: !!photo?.data,
-            hasBase64: !!photo?.base64,
-            mimeType: photo?.mimeType,
-            keys: Object.keys(photo || {}),
-          });
-          await session.audio.speak('Photo failed.');
-          return;
-        }
-
-        data.images.push(captured);
-        data.state = 'collecting';
-
-        console.log('Photo captured, starting auto-review', {
-          count: data.images.length,
-          mimeType: captured.mimeType,
-          base64Length: captured.base64.length,
-        });
-
-        await session.audio.speak('Captured. Analyzing...');
-
-        const reviewed = await this.reviewCurrentItem(session, data);
-
-        console.log('Review result', {
-          reviewed,
-          record: data.record,
-        });
-
-        if (reviewed && data.record.productName) {
-          await this.saveItem(session, data, false);
-        } else if (reviewed) {
-          await session.audio.speak(`Could not save. ${shortMissingMessage(data.record)} Say corrections or retake.`);
-          data.state = 'ready';
-        }
-      } catch (err) {
-        console.error('Auto pipeline failed:', err);
-        await session.audio.speak('Processing failed.');
-        data.state = 'idle';
-      }
+      // Backup handler only. Main path is short-press -> requestPhoto -> handleCapturedPhoto.
+      // This prevents duplicate processing if the SDK also emits onPhotoTaken for the same capture.
     });
 
     session.events.onTranscription(async (t: any) => {
@@ -365,7 +302,7 @@ class ProductScannerApp extends AppServer {
             data.record.unavailableFields.push(unavailable);
           }
           const stillMissing = missingFields(data.record);
-          if (!stillMissing.length) {
+          if (!stillMissing.length && data.record.productName) {
             await this.saveItem(session, data, false);
           } else {
             await session.audio.speak(shortMissingMessage(data.record));
@@ -397,7 +334,7 @@ class ProductScannerApp extends AppServer {
           data.state = 'idle';
           data.images = [];
           data.record = emptyRecord();
-          await session.audio.speak('Ready. Press button to retake.');
+          await session.audio.speak('Ready. Press the right side button to capture again.');
           return;
         }
 
@@ -412,6 +349,48 @@ class ProductScannerApp extends AppServer {
     session.events.onButtonPress(async (btn: any) => {
       console.log('Button press:', btn?.pressType, btn);
 
+      const buttonId = String(btn?.buttonId || btn?.button || '').toLowerCase();
+      const isShortPress = btn?.pressType === 'short';
+      const isRightSideButton =
+        buttonId.includes('right') ||
+        buttonId.includes('main') ||
+        buttonId === '';
+
+      if (isShortPress && isRightSideButton) {
+        if (data.state === 'reviewing' || data.state === 'saving') {
+          await session.audio.speak('Still processing, please wait.');
+          return;
+        }
+
+        try {
+          resetItem(data);
+
+          const photo = await session.camera.requestPhoto({
+            metadata: {
+              reason: 'product-scan',
+              source: 'short-press-right-button',
+            },
+          });
+
+          console.log('requestPhoto returned', {
+            hasPhotoData: !!photo?.photoData,
+            hasBuffer: !!photo?.buffer,
+            hasData: !!photo?.data,
+            hasBase64: !!photo?.base64,
+            mimeType: photo?.mimeType,
+            keys: Object.keys(photo || {}),
+          });
+
+          await this.handleCapturedPhoto(session, data, photo);
+        } catch (err) {
+          console.error('requestPhoto failed:', err);
+          data.state = 'idle';
+          await session.audio.speak('Image capture failed.');
+        }
+
+        return;
+      }
+
       if (btn?.pressType === 'long') {
         if (data.state === 'idle' || data.state === 'ready') {
           await this.readList(session, data);
@@ -420,8 +399,6 @@ class ProductScannerApp extends AppServer {
           await session.audio.speak('Cancelled.');
         }
       }
-
-      // Short press should trigger native photo capture and then onPhotoTaken
     });
 
     session.events.onDisconnected(() => {
@@ -430,9 +407,72 @@ class ProductScannerApp extends AppServer {
     });
   }
 
-  private async reviewCurrentItem(session: any, data: SessionData): Promise<boolean> {
+  private async handleCapturedPhoto(session: any, data: SessionData, photo: any) {
+    console.log('handleCapturedPhoto called', {
+      state: data.state,
+      hasPhotoData: !!photo?.photoData,
+      hasBuffer: !!photo?.buffer,
+      hasData: !!photo?.data,
+      hasBase64: !!photo?.base64,
+      mimeType: photo?.mimeType,
+      keys: Object.keys(photo || {}),
+    });
+
+    if (data.state === 'reviewing' || data.state === 'saving') {
+      await session.audio.speak('Still processing, please wait.');
+      return;
+    }
+
+    try {
+      const captured = photoToCapturedImage(photo);
+
+      if (!captured) {
+        console.error('Photo had no usable image data.', {
+          hasPhotoData: !!photo?.photoData,
+          hasBuffer: !!photo?.buffer,
+          hasData: !!photo?.data,
+          hasBase64: !!photo?.base64,
+          mimeType: photo?.mimeType,
+          keys: Object.keys(photo || {}),
+        });
+        await session.audio.speak('Photo failed.');
+        data.state = 'idle';
+        return;
+      }
+
+      data.images.push(captured);
+      data.state = 'collecting';
+
+      console.log('Photo captured, starting review', {
+        count: data.images.length,
+        mimeType: captured.mimeType,
+        base64Length: captured.base64.length,
+      });
+
+      const reviewed = await this.reviewCurrentItem(data);
+
+      console.log('Review result', {
+        reviewed,
+        record: data.record,
+      });
+
+      if (reviewed && data.record.productName) {
+        await this.saveItem(session, data, false);
+      } else if (reviewed) {
+        data.state = 'ready';
+        await session.audio.speak(
+          `Could not save automatically. ${shortMissingMessage(data.record)} Say corrections or retake.`
+        );
+      }
+    } catch (err) {
+      console.error('Auto pipeline failed:', err);
+      data.state = 'idle';
+      await session.audio.speak('Processing failed.');
+    }
+  }
+
+  private async reviewCurrentItem(data: SessionData): Promise<boolean> {
     if (!data.images.length) {
-      await session.audio.speak('No photos yet.');
       return false;
     }
 
@@ -511,15 +551,6 @@ Rules:
       });
 
       data.state = 'idle';
-
-      if (err?.status === 404) {
-        await session.audio.speak('AI model unavailable.');
-      } else if (err?.status === 429) {
-        await session.audio.speak('AI quota exceeded.');
-      } else {
-        await session.audio.speak('Review failed.');
-      }
-
       return false;
     }
   }
@@ -579,10 +610,10 @@ Rules:
         data.images = [];
         data.record = emptyRecord();
         data.state = 'idle';
-        await session.audio.speak('Saved. Ready for next.');
+        await session.audio.speak('Image captured and saved. Ready for next product.');
       } else {
         resetItem(data);
-        await session.audio.speak('Saved.');
+        await session.audio.speak('Image captured and saved.');
       }
     } catch (err: any) {
       console.error('Save failed:', {
