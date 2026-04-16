@@ -6,6 +6,19 @@ const { AppServer } = MentraSDK as any;
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
+if (!process.env.DATABASE_URL) {
+  console.error('Missing DATABASE_URL');
+}
+if (!process.env.GEMINI_API_KEY) {
+  console.error('Missing GEMINI_API_KEY');
+}
+if (!process.env.MENTRA_PACKAGE_NAME) {
+  console.error('Missing MENTRA_PACKAGE_NAME');
+}
+if (!process.env.MENTRA_API_KEY) {
+  console.error('Missing MENTRA_API_KEY');
+}
+
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
@@ -63,7 +76,8 @@ function parseJSON(text: string) {
   try {
     const match = text.match(/\{[\s\S]*\}/);
     return match ? JSON.parse(match[0]) : null;
-  } catch {
+  } catch (err) {
+    console.error('parseJSON failed:', err);
     return null;
   }
 }
@@ -209,6 +223,14 @@ function photoToCapturedImage(photo: any): CapturedImage | null {
       raw = Buffer.isBuffer(photo.buffer) ? photo.buffer : Buffer.from(photo.buffer);
     } else if (photo?.photoData) {
       raw = Buffer.isBuffer(photo.photoData) ? photo.photoData : Buffer.from(photo.photoData);
+    } else if (photo?.data) {
+      raw = Buffer.isBuffer(photo.data) ? photo.data : Buffer.from(photo.data);
+    } else if (photo?.base64) {
+      return {
+        base64: photo.base64,
+        mimeType: photo?.mimeType || 'image/jpeg',
+        capturedAt: new Date().toISOString(),
+      };
     }
 
     if (!raw || raw.length === 0) return null;
@@ -218,7 +240,8 @@ function photoToCapturedImage(photo: any): CapturedImage | null {
       mimeType: photo?.mimeType || 'image/jpeg',
       capturedAt: new Date().toISOString(),
     };
-  } catch {
+  } catch (err) {
+    console.error('photoToCapturedImage failed:', err);
     return null;
   }
 }
@@ -232,6 +255,7 @@ class ProductScannerApp extends AppServer {
       subscriptions: {
         transcription: true,
         buttonPress: true,
+        photoTaken: true,
       },
     });
   }
@@ -245,13 +269,26 @@ class ProductScannerApp extends AppServer {
     };
 
     this.sessions.set(sessionId, data);
-    console.log(`Session started for user ${userId}`);
+    console.log(`Session started for user ${userId} (${sessionId})`);
 
-    await session.audio.speak('Scanner ready. Press button to scan.');
+    try {
+      await session.audio.speak('Scanner ready. Press button to scan.');
+    } catch (err) {
+      console.error('Initial speak failed:', err);
+    }
 
-    // ─── AUTO PIPELINE: capture → review → save ───────────────────────────────
     session.events.onPhotoTaken(async (photo: any) => {
-      // Prevent concurrent reviews/saves
+      console.log('onPhotoTaken fired', {
+        sessionId,
+        state: data.state,
+        hasPhotoData: !!photo?.photoData,
+        hasBuffer: !!photo?.buffer,
+        hasData: !!photo?.data,
+        hasBase64: !!photo?.base64,
+        mimeType: photo?.mimeType,
+        keys: Object.keys(photo || {}),
+      });
+
       if (data.state === 'reviewing' || data.state === 'saving') {
         await session.audio.speak('Still processing, please wait.');
         return;
@@ -259,13 +296,20 @@ class ProductScannerApp extends AppServer {
 
       try {
         const captured = photoToCapturedImage(photo);
+
         if (!captured) {
-          console.error('Photo event had no usable image data.');
+          console.error('Photo event had no usable image data.', {
+            hasPhotoData: !!photo?.photoData,
+            hasBuffer: !!photo?.buffer,
+            hasData: !!photo?.data,
+            hasBase64: !!photo?.base64,
+            mimeType: photo?.mimeType,
+            keys: Object.keys(photo || {}),
+          });
           await session.audio.speak('Photo failed.');
           return;
         }
 
-        // Always accept photos regardless of current state
         data.images.push(captured);
         data.state = 'collecting';
 
@@ -277,14 +321,16 @@ class ProductScannerApp extends AppServer {
 
         await session.audio.speak('Captured. Analyzing...');
 
-        // Auto-review with Gemini
         const reviewed = await this.reviewCurrentItem(session, data);
 
-        // Auto-save if we have at least a product name
+        console.log('Review result', {
+          reviewed,
+          record: data.record,
+        });
+
         if (reviewed && data.record.productName) {
           await this.saveItem(session, data, false);
         } else if (reviewed) {
-          // Reviewed but missing product name — prompt user
           await session.audio.speak(`Could not save. ${shortMissingMessage(data.record)} Say corrections or retake.`);
           data.state = 'ready';
         }
@@ -294,7 +340,6 @@ class ProductScannerApp extends AppServer {
         data.state = 'idle';
       }
     });
-    // ─────────────────────────────────────────────────────────────────────────
 
     session.events.onTranscription(async (t: any) => {
       if (!t.isFinal) return;
@@ -313,7 +358,6 @@ class ProductScannerApp extends AppServer {
         return;
       }
 
-      // Manual corrections when in ready state (after a failed auto-save)
       if (data.state === 'ready') {
         const unavailable = parseUnavailableField(text);
         if (unavailable) {
@@ -332,7 +376,6 @@ class ProductScannerApp extends AppServer {
         const manual = parseManualField(text);
         if (manual) {
           data.record = { ...data.record, ...manual };
-          // Auto-save once product name is filled in
           if (data.record.productName) {
             await this.saveItem(session, data, false);
           } else {
@@ -367,9 +410,8 @@ class ProductScannerApp extends AppServer {
     });
 
     session.events.onButtonPress(async (btn: any) => {
-      console.log('Button press:', btn?.pressType);
+      console.log('Button press:', btn?.pressType, btn);
 
-      // Long press = read history or cancel current
       if (btn?.pressType === 'long') {
         if (data.state === 'idle' || data.state === 'ready') {
           await this.readList(session, data);
@@ -378,7 +420,8 @@ class ProductScannerApp extends AppServer {
           await session.audio.speak('Cancelled.');
         }
       }
-      // Short press is handled natively by SDK → fires onPhotoTaken automatically
+
+      // Short press should trigger native photo capture and then onPhotoTaken
     });
 
     session.events.onDisconnected(() => {
@@ -387,7 +430,6 @@ class ProductScannerApp extends AppServer {
     });
   }
 
-  // Returns true if review succeeded (even if fields are missing)
   private async reviewCurrentItem(session: any, data: SessionData): Promise<boolean> {
     if (!data.images.length) {
       await session.audio.speak('No photos yet.');
@@ -397,10 +439,11 @@ class ProductScannerApp extends AppServer {
     data.state = 'reviewing';
 
     try {
-      const prompt = `You are extracting structured product packaging data from multiple photos of the SAME product.
+      const prompt = `
+You are extracting structured product packaging data from multiple photos of the SAME product.
 Merge details across all photos into one record.
 
-Return ONLY JSON:
+Return ONLY valid JSON:
 {
   "product_name": null,
   "vendor_name": null,
@@ -415,27 +458,42 @@ Rules:
 - country_of_origin = country of origin or made in.
 - expiration_date = expiration, expiry, BB, best by, or use by date.
 - expiration_date must be YYYY-MM-DD if possible.
-- Use null if unknown.`;
+- Use null if unknown.
+`.trim();
 
-      const parts: any[] = data.images.map((img) => ({
-        inlineData: {
-          mimeType: img.mimeType,
-          data: img.base64,
-        },
-      }));
+      const parts: any[] = [
+        { text: prompt },
+        ...data.images.map((img) => ({
+          inlineData: {
+            mimeType: img.mimeType,
+            data: img.base64,
+          },
+        })),
+      ];
 
-      parts.push(prompt);
+      console.log('Sending photos to Gemini', {
+        photoCount: data.images.length,
+        mimeTypes: data.images.map((i) => i.mimeType),
+      });
 
-      console.log('Sending photos to Gemini', { photoCount: data.images.length });
+      const resp = await model.generateContent({
+        contents: [
+          {
+            role: 'user',
+            parts,
+          },
+        ],
+      });
 
-      const resp = await model.generateContent(parts);
-      const text = resp.response.text();
+      const text = resp?.response?.text?.() || '';
       const parsed = parseJSON(text);
 
       console.log('Gemini raw response:', text);
       console.log('Gemini parsed response:', parsed);
 
-      if (parsed) {
+      if (!parsed) {
+        console.error('Gemini returned unparseable JSON');
+      } else {
         data.record.productName = parsed.product_name || data.record.productName;
         data.record.vendorName = parsed.vendor_name || data.record.vendorName;
         data.record.countryOfOrigin = parsed.country_of_origin || data.record.countryOfOrigin;
@@ -445,7 +503,13 @@ Rules:
       data.state = 'ready';
       return true;
     } catch (err: any) {
-      console.error('Review failed:', err);
+      console.error('Review failed:', {
+        message: err?.message,
+        status: err?.status,
+        stack: err?.stack,
+        raw: err,
+      });
+
       data.state = 'idle';
 
       if (err?.status === 404) {
@@ -455,6 +519,7 @@ Rules:
       } else {
         await session.audio.speak('Review failed.');
       }
+
       return false;
     }
   }
@@ -472,6 +537,15 @@ Rules:
       : null;
 
     try {
+      console.log('Saving item to DB', {
+        userId: data.userId,
+        productName: data.record.productName,
+        vendorName: data.record.vendorName,
+        countryOfOrigin: data.record.countryOfOrigin,
+        expirationDate: data.record.expirationDate,
+        imageCount: data.images.length,
+      });
+
       await db.query(
         `INSERT INTO scanned_items(
           user_id,
@@ -499,6 +573,8 @@ Rules:
         ]
       );
 
+      console.log('DB save successful');
+
       if (startNext) {
         data.images = [];
         data.record = emptyRecord();
@@ -508,8 +584,15 @@ Rules:
         resetItem(data);
         await session.audio.speak('Saved.');
       }
-    } catch (err) {
-      console.error('Save failed:', err);
+    } catch (err: any) {
+      console.error('Save failed:', {
+        message: err?.message,
+        code: err?.code,
+        detail: err?.detail,
+        stack: err?.stack,
+        raw: err,
+      });
+
       data.state = 'ready';
       await session.audio.speak('Save failed.');
     }
