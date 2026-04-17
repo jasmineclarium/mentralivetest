@@ -260,47 +260,23 @@ class ProductScannerApp extends AppServer {
     this.sessions.set(sessionId, data);
     console.log(`Session started for user ${userId}`);
 
-    // Critical: explicitly subscribe so events actually reach the app.
-    try {
-      await session.updateSubscriptions([
-        {
-          type: 'TRANSCRIPTION',
-          config: {
-            languages: ['en-US'],
-            interimResults: false,
-          },
-        },
-        {
-          type: 'BUTTON_PRESS',
-          config: {
-            buttons: ['MAIN'],
-          },
-        },
-      ]);
-
-      console.log('Subscriptions updated successfully');
-    } catch (err) {
-      console.error('updateSubscriptions failed:', err);
-    }
-
-    await session.audio.speak(
-      'Welcome to Clarium Vision. Say capture when you are ready to scan a product.'
-    );
-
+    // Attach handlers FIRST
     session.events.onTranscription(async (t: any) => {
-      if (!t?.isFinal) return;
+      console.log('Raw transcription event:', JSON.stringify(t, null, 2));
 
-      const text = (t.text || '').toLowerCase().trim();
-      console.log('Final transcription:', text);
+      const text = (t?.text || '').toLowerCase().trim();
+      console.log('Parsed transcription text:', text);
 
-      // Voice trigger for capture
-      if (
+      if (!text) return;
+
+      const isCaptureCommand =
         text === 'capture' ||
         text === 'scan' ||
         text.includes('capture image') ||
         text.includes('take picture') ||
-        text.includes('scan product')
-      ) {
+        text.includes('scan product');
+
+      if (isCaptureCommand) {
         if (data.state === 'reviewing' || data.state === 'saving') {
           await session.audio.speak('Still processing, please wait.');
           return;
@@ -401,12 +377,10 @@ class ProductScannerApp extends AppServer {
       }
     });
 
-    // Keep button logging for debugging, but voice is the primary trigger now.
     session.events.onButtonPress(async (btn: any) => {
       console.log('Button press:', btn?.pressType, btn);
     });
 
-    // Optional passive logging so you can see whether Mentra emits photo events too.
     session.events.onPhotoTaken(async (photo: any) => {
       console.log('onPhotoTaken fired', {
         hasPhotoData: !!photo?.photoData,
@@ -422,6 +396,32 @@ class ProductScannerApp extends AppServer {
       this.sessions.delete(sessionId);
       console.log(`Session disconnected: ${sessionId}`);
     });
+
+    // Subscribe AFTER handlers are attached
+    try {
+      await session.updateSubscriptions([
+        {
+          type: 'TRANSCRIPTION',
+          config: {
+            languages: ['en-US'],
+            interimResults: false,
+          },
+        },
+        {
+          type: 'BUTTON_PRESS',
+          config: {
+            buttons: ['MAIN'],
+          },
+        },
+      ]);
+      console.log('Subscriptions updated successfully');
+    } catch (err) {
+      console.error('updateSubscriptions failed:', err);
+    }
+
+    await session.audio.speak(
+      'Welcome to Clarium Vision. Say capture when you are ready to scan a product.'
+    );
   }
 
   private async handleCapturedPhoto(session: any, data: SessionData, photo: any) {
